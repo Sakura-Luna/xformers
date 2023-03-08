@@ -27,32 +27,25 @@ jobs:
       fail-fast: false
       matrix:
         os:
-          - ubuntu-22.04
+          # - ubuntu-22.04
           - windows-2019
         python:
-          - "3.7"
           - "3.8"
-          - "3.9"
           - "3.10"
         config:
-          - torch_version: "1.13.1+cu117"
-            torch_version_constraint: "1.13.1"
-            cuda_version: "11.7.1"
-            pip_index: https://download.pytorch.org/whl/cu117
-            cuda_run_file: https://developer.download.nvidia.com/compute/cuda/11.7.1/local_installers/cuda_11.7.1_515.65.01_linux.run
+          - torch_version: "2.0.0+cu118"
+            torch_version_constraint: "2.0.0"
+            cuda_version: "11.8.0"
+            pip_index: https://download.pytorch.org/whl/test/cu118
+            cuda_run_file: https://developer.download.nvidia.com/compute/cuda/11.8.0/local_installers/cuda_11.8.0_520.61.05_linux.run
             publish: true # publish only latest version
 
-          - torch_version: "1.12.1+cu116"
+          - torch_version: "1.12.1+cu113"
             torch_version_constraint: "1.12.1"
-            cuda_version: "11.6.2"
-            pip_index: https://download.pytorch.org/whl/cu116
-            cuda_run_file: https://developer.download.nvidia.com/compute/cuda/11.6.2/local_installers/cuda_11.6.2_510.47.03_linux.run
+            cuda_version: "11.3.1"
+            pip_index: https://download.pytorch.org/whl/cu113
+            cuda_run_file: https://developer.download.nvidia.com/compute/cuda/11.3.1/local_installers/cuda_11.3.1_465.19.01_linux.run
             publish: false
-        include:
-          # publish source distribution only from this runner
-          - os: ubuntu-22.04
-            python: "3.10"
-            sdist: true
 
     name: ${{ matrix.os }}-py${{ matrix.python }}-torch${{ matrix.config.torch_version }}
     runs-on: ${{ matrix.os }}
@@ -117,20 +110,4 @@ jobs:
           name: ${{ matrix.os }}-py${{ matrix.python }}-torch${{ matrix.config.torch_version }}
           path: dist/*.whl
 
-      - name: Upload wheel to PyPi
-        if: ${{ matrix.config.publish }}
-        run: $PY -m twine upload dist/*.whl
-        env:
-          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
-
-      - name: Upload source distribution to PyPi
-        if: ${{ matrix.config.publish && matrix.sdist }}
-        run: |
-          rm -rf dist/
-          # unpin pytorch version
-          git checkout HEAD -- ./requirements.txt
-          $PY setup.py sdist -d sdist/
-          $PY -m twine upload sdist/*
-        env:
-          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
 # Note: it might be helpful to have additional steps that test if the built wheels actually work
