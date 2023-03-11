@@ -37,7 +37,7 @@ mem_efficient_attention_backward_cutlass(
     double dropout_p, // dropout probability
     int64_t rng_seed, // seed using for generating random numbers for dropout
     int64_t rng_offset, // offset into random number sequence
-    bool causal,
+    int64_t custom_mask_type,
     const c10::optional<double> scale) {
 #ifdef XFORMERS_MEM_EFF_ATTENTION_DISABLE_BACKWARD
   TORCH_CHECK(
@@ -133,7 +133,13 @@ mem_efficient_attention_backward_cutlass(
     grad_v = at::empty(value.sizes(), value.options());
   }
   if (bias_requires_grad) {
-    grad_bias = at::empty(bias->sizes(), bias->options());
+    // force alignment for the last dim
+    std::vector<int64_t> sz = bias->sizes().vec();
+    int64_t lastDim = sz[sz.size() - 1];
+    int64_t alignTo = 16;
+    sz[sz.size() - 1] = alignTo * ((lastDim + alignTo - 1) / alignTo);
+    grad_bias = at::empty(sz, bias->options())
+                    .slice(/*dim=*/-1, /*start=*/0, /*end=*/lastDim);
   }
   at::Tensor workspace;
 
@@ -145,8 +151,7 @@ mem_efficient_attention_backward_cutlass(
 
   bool kernel_launched = false;
   const auto maxK = std::max(query.size(3), value.size(3));
-  const auto maxShmem =
-      getMaximumSharedMemoryPerBlockKb(computeCapability) * 1024;
+  const auto maxShmem = p->sharedMemPerBlockOptin;
 
   auto launchKernel = [&](auto _k, auto kernel_fn) {
     using Kernel = decltype(_k);
@@ -207,7 +212,7 @@ mem_efficient_attention_backward_cutlass(
     p.num_keys = max_seqlen_k;
     p.num_batches = cu_seqlens_q.has_value() ? cu_seqlens_q->size(0) - 1 : B;
     p.num_heads = nH;
-    p.causal = causal;
+    p.custom_mask_type = custom_mask_type;
     if (scale.has_value()) {
       p.scale = float(*scale);
     } else {
@@ -252,6 +257,9 @@ mem_efficient_attention_backward_cutlass(
 
     if (bias.has_value()) {
       CHECK_NOSPARSE_LASTCONTIGUOUS_CUDA((*bias));
+      TORCH_CHECK(
+          bias->scalar_type() == CutlassToAtenDtype<scalar_t>::atScalarType(),
+          "invalid dtype for bias - should match query's dtype");
 
       p.bias_ptr = (scalar_t*)bias->data_ptr();
 

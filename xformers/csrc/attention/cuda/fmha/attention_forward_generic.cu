@@ -17,57 +17,6 @@
 #include "pytorch_utils.h"
 
 namespace {
-template <typename scalar_t>
-struct TypeTraits;
-
-template <>
-struct TypeTraits<cutlass::half_t> {
-  using scalar_t = cutlass::half_t;
-
-  static constexpr __host__ at::ScalarType atScalarType() {
-    return at::ScalarType::Half;
-  }
-  template <int nDim>
-  static __host__ at::PackedTensorAccessor32<scalar_t, nDim> packed_accessor(
-      at::Tensor const& tensor) {
-    return at::PackedTensorAccessor32<scalar_t, nDim>(
-        (scalar_t*)(tensor.data_ptr()),
-        tensor.sizes().data(),
-        tensor.strides().data());
-  }
-};
-
-template <>
-struct TypeTraits<cutlass::bfloat16_t> {
-  using scalar_t = cutlass::bfloat16_t;
-
-  static constexpr __host__ at::ScalarType atScalarType() {
-    return at::ScalarType::BFloat16;
-  }
-  template <int nDim>
-  static __host__ at::PackedTensorAccessor32<scalar_t, nDim> packed_accessor(
-      at::Tensor const& tensor) {
-    return at::PackedTensorAccessor32<scalar_t, nDim>(
-        (scalar_t*)(tensor.data_ptr()),
-        tensor.sizes().data(),
-        tensor.strides().data());
-  }
-};
-
-template <>
-struct TypeTraits<float> {
-  using scalar_t = float;
-
-  static constexpr __host__ at::ScalarType atScalarType() {
-    return at::ScalarType::Float;
-  }
-  template <int nDim>
-  static __host__ at::PackedTensorAccessor32<scalar_t, nDim> packed_accessor(
-      at::Tensor const& tensor) {
-    return tensor.packed_accessor32<scalar_t, nDim>();
-  }
-};
-
 /*
   There are 2 modes for using this function.
   (Mode BMHK) With all the heads having the same seqlen
@@ -89,7 +38,7 @@ efficient_attention_forward_cutlass(
     const c10::optional<int64_t> max_seqlen_q_,
     double dropout_p, // attention matrix dropout probability
     bool compute_logsumexp,
-    bool causal,
+    int64_t custom_mask_type,
     c10::optional<double> scale,
     const c10::optional<at::Tensor>& causal_diagonal,
     const c10::optional<at::Tensor>& seqlen_k) {
@@ -171,8 +120,7 @@ efficient_attention_forward_cutlass(
   const int computeCapability = p->major * 10 + p->minor;
 
   bool kernel_launched = false;
-  const auto maxShmem =
-      getMaximumSharedMemoryPerBlockKb(computeCapability) * 1024;
+  const auto maxShmem = p->sharedMemPerBlockOptin;
 
   auto launchKernel = [&](auto _k, auto kernel_fn) {
     using Kernel = decltype(_k);
@@ -209,7 +157,7 @@ efficient_attention_forward_cutlass(
     res = at::empty(
         {B, M, num_heads, Kv},
         query.options().dtype(
-            TypeTraits<typename Kernel::output_t>::atScalarType()));
+            CutlassToAtenDtype<typename Kernel::output_t>::atScalarType()));
 
     // NOTE: Should be aligned (by padding) in case M is
     // not a good number for loading during backward
@@ -232,7 +180,8 @@ efficient_attention_forward_cutlass(
       output_accum = at::empty(
           {B, M, num_heads, Kv},
           query.options().dtype(
-              TypeTraits<typename Kernel::output_accum_t>::atScalarType()));
+              CutlassToAtenDtype<
+                  typename Kernel::output_accum_t>::atScalarType()));
       p.output_accum_ptr =
           (typename Kernel::output_accum_t*)output_accum.data_ptr();
     } else {
@@ -251,7 +200,7 @@ efficient_attention_forward_cutlass(
     p.num_queries = max_seqlen_q;
     p.num_keys = max_seqlen_k;
     p.num_batches = seqstart_q.has_value() ? seqstart_q->size(0) - 1 : B;
-    p.causal = causal;
+    p.custom_mask_type = custom_mask_type;
     p.causal_diagonal_ptr = nullptr;
     if (causal_diagonal.has_value()) {
       CHECK_NOSPARSE_LASTCONTIGUOUS_CUDA(causal_diagonal.value());
@@ -285,6 +234,9 @@ efficient_attention_forward_cutlass(
 
     if (bias.has_value()) {
       CHECK_NOSPARSE_LASTCONTIGUOUS_CUDA((*bias));
+      TORCH_CHECK(
+          bias->scalar_type() == CutlassToAtenDtype<scalar_t>::atScalarType(),
+          "invalid dtype for bias - should match query's dtype");
       p.attn_bias_ptr = (scalar_t*)bias->data_ptr();
 
       // assign strides for bias, viewed as

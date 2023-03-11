@@ -76,6 +76,13 @@ template <
     bool kSupportsDropout_ = true,
     bool kSupportsBias_ = true>
 struct AttentionKernel {
+  enum CustomMaskType {
+    NoCustomMask = 0,
+    CausalFromTopLeft = 1,
+    CausalFromBottomRight = 2,
+    NumCustomMaskTypes,
+  };
+
   using scalar_t = scalar_t_;
   using accum_t = float;
   using lse_scalar_t = float;
@@ -135,7 +142,7 @@ struct AttentionKernel {
     int32_t num_queries;
     int32_t num_keys;
 
-    bool causal;
+    uint8_t custom_mask_type = NoCustomMask;
 
     int32_t q_strideM;
     int32_t k_strideM;
@@ -246,12 +253,15 @@ struct AttentionKernel {
             batch_id * lse_dim * num_heads + head_id * lse_dim + query_start;
       }
 
+      // Custom masking
       if (causal_diagonal_ptr) {
         causal_diagonal_offset = causal_diagonal_ptr[batch_id];
       }
-
-      num_queries -= query_start;
-      if (causal) {
+      if (custom_mask_type == CausalFromBottomRight) {
+        causal_diagonal_offset += num_keys - num_queries;
+      }
+      if (custom_mask_type == CausalFromTopLeft ||
+          custom_mask_type == CausalFromBottomRight) {
         // the bottom row of the current block is query_start + kQueriesPerBlock
         // the last active key is then query_start + causal_diagonal_offset +
         // kQueriesPerBlock so num_keys is the min between actual num_keys and
@@ -260,13 +270,15 @@ struct AttentionKernel {
             int32_t(query_start + causal_diagonal_offset + kQueriesPerBlock),
             num_keys);
       }
+
+      num_queries -= query_start;
       num_batches = 0; // no longer used after
 
       // If num_queries == 1, and there is only one key head we're wasting
       // 15/16th of tensor core compute In that case :
       //  - we only launch kernels for head_id % kQueriesPerBlock == 0
       //  - we iterate over heads instead of queries (strideM = strideH)
-      if (num_queries == 1 && k_strideH == 0) {
+      if (num_queries == 1 && k_strideH == 0 && v_strideH == 0) {
         if (head_id % kQueriesPerBlock != 0)
           return false;
         q_strideM = q_strideH;
@@ -274,7 +286,7 @@ struct AttentionKernel {
         num_heads = 1; // unused but here for intent
         // remove causal since n_query = 1
         // otherwise, offset would change with head !
-        causal = false;
+        custom_mask_type = NoCustomMask;
         o_strideM = head_dim_value;
       }
 
@@ -295,6 +307,7 @@ struct AttentionKernel {
       head_dim = warp_uniform(head_dim);
       head_dim_value = warp_uniform(head_dim_value);
       o_strideM = warp_uniform(o_strideM);
+      custom_mask_type = warp_uniform(custom_mask_type);
       return true;
     }
 
@@ -529,27 +542,39 @@ struct AttentionKernel {
     if (kSupportsBias) {
       CHECK_ALIGNED_PTR(p.attn_bias_ptr, kAlignmentQ);
       XFORMERS_CHECK(
-          p.bias_strideB % kAlignmentQ == 0,
-          "attn_bias is not correctly aligned");
+          p.num_batches <= 1 || p.bias_strideB % kAlignmentQ == 0,
+          "attn_bias is not correctly aligned (strideB)");
       XFORMERS_CHECK(
-          p.bias_strideH % kAlignmentQ == 0,
-          "attn_bias is not correctly aligned");
+          p.num_heads <= 1 || p.bias_strideH % kAlignmentQ == 0,
+          "attn_bias is not correctly aligned (strideH)");
       XFORMERS_CHECK(
           p.bias_strideM % kAlignmentQ == 0,
           "attn_bias is not correctly aligned");
     }
     XFORMERS_CHECK(
-        p.q_strideM % kAlignmentQ == 0, "query is not correctly aligned");
+        p.q_strideM % kAlignmentQ == 0,
+        "query is not correctly aligned (strideM)");
     XFORMERS_CHECK(
-        p.k_strideM % kAlignmentK == 0, "key is not correctly aligned");
+        p.k_strideM % kAlignmentK == 0,
+        "key is not correctly aligned (strideM)");
     XFORMERS_CHECK(
-        p.v_strideM % kAlignmentV == 0, "value is not correctly aligned");
+        p.v_strideM % kAlignmentV == 0,
+        "value is not correctly aligned (strideM)");
     XFORMERS_CHECK(
-        p.q_strideH % kAlignmentQ == 0, "query is not correctly aligned");
+        p.num_heads <= 1 || p.q_strideH % kAlignmentQ == 0,
+        "query is not correctly aligned (strideH)");
     XFORMERS_CHECK(
-        p.k_strideH % kAlignmentK == 0, "key is not correctly aligned");
+        p.num_heads <= 1 || p.k_strideH % kAlignmentK == 0,
+        "key is not correctly aligned (strideH)");
     XFORMERS_CHECK(
-        p.v_strideH % kAlignmentV == 0, "value is not correctly aligned");
+        p.num_heads <= 1 || p.v_strideH % kAlignmentV == 0,
+        "value is not correctly aligned (strideH)");
+    XFORMERS_CHECK(
+        p.causal_diagonal_ptr == nullptr || p.custom_mask_type != NoCustomMask,
+        "`causal_diagonal_ptr` is only useful when `custom_mask_type` is causal");
+    XFORMERS_CHECK(
+        p.custom_mask_type < NumCustomMaskTypes,
+        "invalid value for `custom_mask_type`");
     return true;
   }
 
@@ -562,7 +587,6 @@ struct AttentionKernel {
     SharedStorage& shared_storage = *((SharedStorage*)smem_buffer);
     auto& m_prime = shared_storage.m_prime;
     auto& s_prime = shared_storage.s_prime;
-    auto& si = shared_storage.after_mm0.si;
     auto& mi = shared_storage.mi;
     const uint32_t query_start = blockIdx.x * kQueriesPerBlock;
 
@@ -757,7 +781,7 @@ struct AttentionKernel {
       // first masked element is x = y + offset -> query_start + offset There is
       // intersection (and we need to mask) if min(iter_key_start +
       // kKeysPerBlock, num_keys)) >= query_start + offset
-      if (p.causal &&
+      if (p.custom_mask_type &&
           cutlass::fast_min(iter_key_start + kKeysPerBlock, p.num_keys) >=
               (query_start + p.causal_diagonal_offset)) {
         auto query_start = blockIdx.x * kQueriesPerBlock;
@@ -791,8 +815,7 @@ struct AttentionKernel {
                             iterative_softmax<
                                 typename MM0::Mma::Operator::IteratorC,
                                 kFullColumns,
-                                kIsFirst,
-                                kKeepOutputInRF>(
+                                kIsFirst>(
                                 accum_o,
                                 accum,
                                 mi,
@@ -1056,8 +1079,7 @@ struct AttentionKernel {
   template <
       typename WarpIteratorC,
       bool kFullColumns,
-      bool kIsFirst,
-      bool kKeepOutputInRF>
+      bool kIsFirst>
   CUTLASS_DEVICE static void iterative_softmax(
       typename WarpIteratorC::Fragment& frag_o, // output so far
       typename WarpIteratorC::Fragment& frag,

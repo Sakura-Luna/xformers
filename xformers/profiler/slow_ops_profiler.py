@@ -104,6 +104,16 @@ class GemmOpComputeFlopsBmm(GemmOpComputeFlops):
         return (bs * a.shape[1], b.shape[-1], b.shape[-2])
 
 
+class GemmOpComputeFlopsAddmm(GemmOpComputeFlops):
+    def _get_mnk(self, inputs: List[Any]) -> Tuple[int, int, int]:
+        return super()._get_mnk(inputs[1:])
+
+
+class GemmOpComputeFlopsAddbmm(GemmOpComputeFlopsBmm):
+    def _get_mnk(self, inputs: List[Any]) -> Tuple[int, int, int]:
+        return super()._get_mnk(inputs[1:])
+
+
 def conv_flop_count(
     x_shape: List[int],
     w_shape: List[int],
@@ -263,8 +273,9 @@ flop_mapping = {
     aten.mv: GemmOpComputeFlopsMv(),  # mat-vec
     aten.mm: GemmOpComputeFlops(),
     aten.matmul: GemmOpComputeFlops(),
-    aten.addmm: GemmOpComputeFlops(),
+    aten.addmm: GemmOpComputeFlopsAddmm(),
     aten.bmm: GemmOpComputeFlopsBmm(),
+    aten.addbmm: GemmOpComputeFlopsAddbmm(),
     aten.linear: GemmOpComputeFlopsLinear(),
     aten.convolution: conv_flop,
     aten._convolution: conv_flop,
@@ -317,7 +328,7 @@ class _OpInfo:
     @property
     def time_computebound_ms(self) -> float:
         assert self.time_ms > 0.0
-        tflop = self.flop_count / (1024**4)
+        tflop = self.flop_count / (1000**4)
         if tflop == 0.0:
             return 0.0
         return min(self.time_ms, 1000 * tflop / self.hardware_tflops_limit)
@@ -349,7 +360,7 @@ class _OpInfoAggregated:
 
     def as_dict(self, **kwargs) -> Dict[str, Any]:
         mem_bound = min(1, self.total_time_membound_ms / self.total_time_ms)
-        tflops = self.total_flop_count / (self.total_time_ms / 1000) / (1024**4)
+        tflops = self.total_flop_count / (self.total_time_ms / 1000) / (1000**4)
         compute_bound = min(1, self.total_time_computebound_ms / self.total_time_ms)
         return {
             "is_exact_flop": self.is_exact_flop,

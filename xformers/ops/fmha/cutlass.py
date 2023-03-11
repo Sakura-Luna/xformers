@@ -9,6 +9,7 @@ from typing import Any, List, Mapping, Optional, Set, Tuple, Union
 import torch
 
 from ..common import get_xformers_operator, register_operator
+from . import attn_bias
 from .attn_bias import (
     AttentionBias,
     BlockDiagonalCausalMask,
@@ -95,9 +96,41 @@ def _check_bias_alignment(
     attn_bias_tensor = _get_tensor_bias(attn_bias)
     if attn_bias_tensor is not None:
         alignment = 128 // torch.finfo(attn_bias_tensor.dtype).bits
-        check_lastdim_alignment_stride1(
-            reasons, "attn_bias", attn_bias_tensor, alignment
-        )
+        show_padding_hint = False
+        for d in range(attn_bias_tensor.ndim - 1):
+            if attn_bias_tensor.stride(d) % alignment != 0:
+                reasons.append(
+                    f"attn_bias.stride(-2) % {alignment} != 0 (attn_bias.stride() = {attn_bias_tensor.stride()})"
+                )
+                show_padding_hint = True
+        if show_padding_hint:
+            reasons.append(
+                """\
+HINT: To use an `attn_bias` with a sequence length that is not a multiple of 8, \
+you need to ensure memory is aligned by slicing a bigger tensor. \
+Example: use `attn_bias = torch.zeros([1, 1, 5, 8])[:,:,:,:5]` instead of `torch.zeros([1, 1, 5, 5])`"""
+            )
+        # We can have stride=0 sometimes if dimension=1
+        if attn_bias_tensor.stride(-1) > 1:
+            reasons.append(
+                f"attn_bias.stride(-1) > 1 (attn_bias.stride() = {attn_bias_tensor.stride()}) - "
+                "you should call `.contiguous()` on the bias"
+            )
+
+
+def _custom_mask_type(bias: Optional[Union[torch.Tensor, AttentionBias]]) -> int:
+    if isinstance(
+        bias,
+        (
+            LowerTriangularMask,
+            BlockDiagonalCausalMask,
+            BlockDiagonalCausalWithOffsetPaddedKeysMask,
+        ),
+    ):
+        return 1
+    if isinstance(bias, attn_bias.BlockDiagonalCausalFromBottomRightMask):
+        return 2
+    return 0
 
 
 @register_operator
@@ -119,6 +152,7 @@ class FwOp(AttentionFwOpBase):
         BlockDiagonalMask,
         BlockDiagonalCausalMask,
         BlockDiagonalCausalWithOffsetPaddedKeysMask,
+        attn_bias.BlockDiagonalCausalFromBottomRightMask,
     }
     SUPPORTS_DROPOUT = True
     SUPPORTS_CUSTOM_SCALE = True
@@ -137,14 +171,6 @@ class FwOp(AttentionFwOpBase):
     ) -> Tuple[torch.Tensor, Optional[Context]]:
         if type(inp.attn_bias) not in FwOp.SUPPORTED_ATTN_BIAS_TYPES:
             raise NotImplementedError("Unsupported attn_bias type")
-        causal = isinstance(
-            inp.attn_bias,
-            (
-                LowerTriangularMask,
-                BlockDiagonalCausalMask,
-                BlockDiagonalCausalWithOffsetPaddedKeysMask,
-            ),
-        )
         seqstart_k, seqstart_q, max_seqlen_q, _ = _get_seqlen_info(inp)
         out, lse, rng_seed, rng_offset = cls.OPERATOR(
             query=inp.query,
@@ -156,7 +182,7 @@ class FwOp(AttentionFwOpBase):
             max_seqlen_q=max_seqlen_q,
             dropout_p=inp.p,
             compute_logsumexp=needs_gradient,
-            causal=causal,
+            custom_mask_type=_custom_mask_type(inp.attn_bias),
             scale=inp.scale,
             causal_diagonal=inp.attn_bias.causal_diagonal
             if isinstance(inp.attn_bias, BlockDiagonalCausalWithOffsetPaddedKeysMask)
@@ -202,11 +228,16 @@ class FwOp(AttentionFwOpBase):
         seqstart_k,
         max_seqlen_q_,
         compute_lse,
-        causal,
+        custom_mask_type,
         *a,
     ) -> int:
         return cls.attn_operator_flop(
-            q, k, v, causal=causal, seqstart_k=seqstart_k, seqstart_q=seqstart_q
+            q,
+            k,
+            v,
+            causal=custom_mask_type > 0,
+            seqstart_k=seqstart_k,
+            seqstart_q=seqstart_q,
         )
 
 
@@ -226,6 +257,7 @@ class BwOp(AttentionBwOpBase):
         # LowerTriangularMaskWithTensorBias,
         BlockDiagonalMask,
         BlockDiagonalCausalMask,
+        attn_bias.BlockDiagonalCausalFromBottomRightMask,
     }
     SUPPORTS_ATTN_BIAS_GRAD = True
     SUPPORTS_DROPOUT = FwOp.SUPPORTS_DROPOUT
@@ -284,10 +316,6 @@ class BwOp(AttentionBwOpBase):
         if type(inp.attn_bias) not in BwOp.SUPPORTED_ATTN_BIAS_TYPES:
             raise NotImplementedError("Unsupported attn_bias type")
 
-        causal = isinstance(
-            inp.attn_bias,
-            (LowerTriangularMask, BlockDiagonalCausalMask),
-        )
         seqstart_k, seqstart_q, max_seqlen_q, max_seqlen_k = _get_seqlen_info(inp)
         dtype = inp.query.dtype
 
@@ -322,7 +350,7 @@ class BwOp(AttentionBwOpBase):
             # was used.
             rng_seed=rng_seed,
             rng_offset=rng_offset,
-            causal=causal,
+            custom_mask_type=_custom_mask_type(inp.attn_bias),
             scale=inp.scale,
         )
 
@@ -353,9 +381,14 @@ class BwOp(AttentionBwOpBase):
         dropout_p,
         rng_seed,
         rng_offset,
-        causal,
+        custom_mask_type,
         scale,
     ) -> int:
         return cls.attn_operator_flop(
-            q, k, v, seqstart_q=cu_seqlens_q, seqstart_k=cu_seqlens_k, causal=causal
+            q,
+            k,
+            v,
+            seqstart_q=cu_seqlens_q,
+            seqstart_k=cu_seqlens_k,
+            causal=custom_mask_type > 0,
         )

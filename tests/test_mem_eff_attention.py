@@ -152,6 +152,12 @@ def _generate_op_device_dtype_biasT_B_Mq_Mkv_H_K_Kv(
                     ]:
                         B, Mq, Mkv, H, K, Kv = shape
                         B = min(B, 12)
+
+                        if (
+                            bias_type
+                            is fmha.attn_bias.BlockDiagonalCausalFromBottomRightMask
+                        ):
+                            Mq, Mkv = min(Mkv, Mq), max(Mkv, Mq) + 2
                         shape = (B, Mq, Mkv, H, K, Kv)
                     combination.append((op, device, dtype, bias_type, *shape))
                     ids.append(
@@ -241,8 +247,14 @@ def ref_attention_bmhk(q, k, v, attn_bias, scale=None) -> torch.Tensor:
 
 
 def _rand_seqlens(
-    r: random.Random, bs: int, q_len: int, kv_len: int
+    r: random.Random,
+    bs: int,
+    q_len: int,
+    kv_len: int,
+    more_keys_than_queries_per_block: bool,
 ) -> Tuple[Sequence[int], Sequence[int]]:
+    if more_keys_than_queries_per_block:
+        assert kv_len >= q_len
     q_len *= bs
     kv_len *= bs
     seqlens_q: List[int] = []
@@ -251,8 +263,18 @@ def _rand_seqlens(
     step_q = [max(1, q_len // 10), max(2, q_len // 2)]
     step_k = [max(1, kv_len // 10), max(2, kv_len // 2)]
     while sum(seqlens_q) < q_len and sum(seqlens_k) < kv_len:
-        seqlens_q.append(r.randrange(*step_q))
-        seqlens_k.append(r.randrange(*step_k))
+        num_queries = r.randrange(*step_q)
+        seqlens_q.append(num_queries)
+
+        if more_keys_than_queries_per_block:
+            # Must select at least `num_queries` keys
+            # But also leave enough keys for later
+            keys_left = kv_len - sum(seqlens_k, 0)
+            queries_left = q_len - sum(seqlens_q[:-1], 0)
+            assert keys_left >= queries_left
+            seqlens_k.append(num_queries + r.randrange(0, keys_left - queries_left))
+        else:
+            seqlens_k.append(r.randrange(*step_k))
     seqlens_q[-1] = q_len - sum(seqlens_q[:-1])
     seqlens_k[-1] = kv_len - sum(seqlens_k[:-1])
     return seqlens_q, seqlens_k
@@ -283,6 +305,7 @@ def create_attn_bias(
     dtype,
     requires_grad: bool,
     fmt: str,
+    op: Type[AttentionOpBase],
 ):
     if bias_type is None or isinstance(None, bias_type):
         return None
@@ -291,11 +314,31 @@ def create_attn_bias(
         if fmt == "BMK":
             batch_size *= num_heads
             num_heads = 1
-        attn_bias = (
-            torch.randn((batch_size, num_heads, 1, kv_len), device=device, dtype=dtype)
-            * 3
-        )
-        attn_bias = attn_bias.expand(batch_size, num_heads, q_len, kv_len)
+        # `small_k` only supports an expanded 1d bias
+        if op in [fmha.small_k.FwOp, fmha.small_k.BwOp]:
+            attn_bias = (
+                torch.randn(
+                    (batch_size, num_heads, 1, kv_len), device=device, dtype=dtype
+                )
+                * 3
+            )
+            attn_bias = attn_bias.expand(batch_size, num_heads, q_len, kv_len)
+        else:
+            align_to = 8
+            attn_bias = (
+                torch.randn(
+                    (
+                        batch_size,
+                        num_heads,
+                        q_len,
+                        align_to * ((kv_len + align_to - 1) // align_to),
+                    ),
+                    device=device,
+                    dtype=dtype,
+                )
+                * 3
+            )[:, :, :, :kv_len]
+
         if requires_grad:
             attn_bias.requires_grad_(True)
         return attn_bias
@@ -314,14 +357,24 @@ def create_attn_bias(
     if bias_type in [
         fmha.attn_bias.BlockDiagonalMask,
         fmha.attn_bias.BlockDiagonalCausalMask,
+        fmha.attn_bias.BlockDiagonalCausalFromBottomRightMask,
     ]:
         # This bias is not supported in BMK format
         assert fmt == "BMHK"
         block_diag = fmha.attn_bias.BlockDiagonalMask.from_seqlens(
-            *_rand_seqlens(r, batch_size, q_len, kv_len)
+            *_rand_seqlens(
+                r,
+                batch_size,
+                q_len,
+                kv_len,
+                more_keys_than_queries_per_block=bias_type
+                is fmha.attn_bias.BlockDiagonalCausalFromBottomRightMask,
+            )
         )
         if bias_type is fmha.attn_bias.BlockDiagonalCausalMask:
             block_diag = block_diag.make_causal()
+        if bias_type is fmha.attn_bias.BlockDiagonalCausalFromBottomRightMask:
+            block_diag = block_diag.make_causal_from_bottomright()
         return block_diag
     if bias_type == fmha.attn_bias.BlockDiagonalCausalWithOffsetPaddedKeysMask:
         assert fmt == "BMHK"
@@ -396,6 +449,7 @@ def create_tensors(
             device=device,
             requires_grad=attn_bias_requires_grad,
             fmt=fmt,
+            op=op,
         )
         if isinstance(
             attn_bias,
@@ -480,6 +534,7 @@ def test_forward(
                 dtype=dtype,
                 requires_grad=False,
                 fmt=fmt,
+                op=op,
             )
         else:
             # bm3hk -> 3 x bmhk
@@ -1347,6 +1402,55 @@ def test_attn_bias_blockdiag_crossattn_causal() -> None:
         assert_allclose(k1, k2)
 
 
+def test_attn_bias_blockdiag_crossattn_causal_with_prefix_qk_cond() -> None:
+    list_q = [
+        torch.randn([1, 3, 1, 8]),
+    ]
+    list_k = [
+        torch.randn([1, 2, 1, 8]),
+    ]
+    attn_bias, q, k, _ = fmha.attn_bias.BlockDiagonalMask.from_tensor_lists_qkv(
+        list_q, list_k
+    )
+    with pytest.raises(ValueError):
+        attn_bias.make_causal_from_bottomright()
+
+
+def test_attn_bias_blockdiag_crossattn_causal_with_prefix() -> None:
+    # Q / KV have different seqlen
+    list_q = [
+        torch.randn([1, 2, 1, 8]),
+        torch.randn([2, 2, 1, 8]),
+    ]
+    list_k = [
+        torch.randn([1, 2, 1, 8]),
+        torch.randn([2, 5, 1, 8]),
+    ]
+
+    attn_bias, q, k, _ = fmha.attn_bias.BlockDiagonalMask.from_tensor_lists_qkv(
+        list_q, list_k
+    )
+    as_tensor = attn_bias.make_causal_from_bottomright().materialize(
+        (q.shape[1], k.shape[1])
+    )
+    m = -math.inf
+    assert_allclose(
+        as_tensor[0:2, 0:2],
+        torch.tensor([[0, m], [0, 0]], dtype=torch.float32),
+        "batch1.1[causal_with_prefix]",
+    )
+    assert_allclose(
+        as_tensor[2:4, 2:7],
+        torch.tensor([[0, 0, 0, 0, m], [0, 0, 0, 0, 0]], dtype=torch.float32),
+        "batch2.1[causal_with_prefix]",
+    )
+    assert_allclose(
+        as_tensor[4:6, 7:12],
+        torch.tensor([[0, 0, 0, 0, m], [0, 0, 0, 0, 0]], dtype=torch.float32),
+        "batch2.2[causal_with_prefix]",
+    )
+
+
 @cuda_only
 def test_attn_bias_padded() -> None:
     bsize, n_heads, d, padding = 8, 3, 8, 32
@@ -1446,3 +1550,84 @@ def test_attn_bias_blockdiag_doc() -> None:
     list_out = attn_bias.split(out)
     print(list_out[0].shape)  # [1, 3, 1, K]
     assert tuple(list_out[0].shape) == (1, 3, 1, K)
+
+
+@cuda_only
+class TestAttnBias:
+    @staticmethod
+    def create_tensors(
+        dtype,
+        B: int = 2,
+        Mq: int = 32,
+        Mkv: int = 32,
+        H: int = 3,
+        K: int = 16,
+        Kv: int = 16,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        return (
+            torch.randn([B, Mq, H, K], device="cuda", dtype=dtype) * 3,
+            torch.randn([B, Mkv, H, K], device="cuda", dtype=dtype) * 3,
+            torch.randn([B, Mkv, H, Kv], device="cuda", dtype=dtype) * 3,
+            torch.randn([B, H, Mq, Mkv], device="cuda", dtype=dtype) * 3,
+        )
+
+    @staticmethod
+    def pad_bias(bias: torch.Tensor) -> torch.Tensor:
+        align_to = 16
+        if (bias.shape[-1] % align_to) == 0:
+            return bias
+        pad_count = align_to - (bias.shape[-1] % align_to)
+        return torch.nn.functional.pad(bias, [0, pad_count])[:, :, :, : bias.shape[-1]]
+
+    def test_f16_biasf32(self) -> None:
+        q, k, v, bias = self.create_tensors(torch.float16)
+        fmha.memory_efficient_attention(q, k, v, attn_bias=bias)
+        bias = bias.to(torch.float32)
+        with pytest.raises((ValueError, RuntimeError)):
+            fmha.memory_efficient_attention(q, k, v, attn_bias=bias)
+
+    def test_f32_biasf16(self) -> None:
+        q, k, v, bias = self.create_tensors(torch.float32)
+        fmha.memory_efficient_attention(q, k, v, attn_bias=bias)
+        bias = bias.to(torch.float16)
+        with pytest.raises((ValueError, RuntimeError)):
+            fmha.memory_efficient_attention(q, k, v, attn_bias=bias)
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+    def test_wrong_alignment(self, dtype) -> None:
+        op = fmha.cutlass.FwOp
+        q, k, v, bias = self.create_tensors(dtype, Mq=7, Mkv=5)
+        try:
+            fmha.memory_efficient_attention(q, k, v, attn_bias=bias, op=(op, None))
+            return
+        except (ValueError, RuntimeError):
+            pass
+        # This case is not supported, likely due to padding issues
+        # Let's make sure it works with padding
+        assert bias.ndim == 4, bias.shape
+        bias_padded = self.pad_bias(bias)
+        out = fmha.memory_efficient_attention(
+            q, k, v, attn_bias=bias_padded, op=(op, None)
+        ).float()
+        ref_out = ref_attention_bmhk(q, k, v, bias)
+        assert_allclose(
+            out, ref_out, atol=op.ERROR_ATOL[dtype], rtol=op.ERROR_RTOL[dtype]
+        )
+
+    def test_permuted_attn_bias(self) -> None:
+        op = fmha.cutlass.FwOp
+        dtype = torch.float16
+        q, k, v, bias = self.create_tensors(dtype, Mq=7, Mkv=7)
+        bias = bias.transpose(-1, -2)  # now `stride(-1) != 1`
+        # Either it works, or it raises an exception
+        # but we should never get a CUDA error
+        try:
+            out = fmha.memory_efficient_attention(
+                q, k, v, attn_bias=bias, op=(op, None)
+            ).float()
+            ref_out = ref_attention_bmhk(q, k, v, bias)
+            assert_allclose(
+                out, ref_out, atol=op.ERROR_ATOL[dtype], rtol=op.ERROR_RTOL[dtype]
+            )
+        except (ValueError, RuntimeError):
+            pass
