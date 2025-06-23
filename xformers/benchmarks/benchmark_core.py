@@ -9,11 +9,11 @@ import torch
 from torch.utils import benchmark
 
 from xformers.components.attention.core import (
-    SparseCS,
     _create_random_sparsity,
     _matmul_with_mask,
     _softmax,
     bmm,
+    SparseCS,
 )
 
 MIN_RUN_TIME = 1
@@ -252,7 +252,10 @@ def bench_bmm():
     compare.print()
 
 
-bench_sddmm()
-bench_matmul_with_mask()
-bench_softmax()
-bench_bmm()
+if torch.version.hip:
+    print("This benchmark could not be done on ROCM!")
+else:
+    bench_sddmm()
+    bench_matmul_with_mask()
+    bench_softmax()
+    bench_bmm()

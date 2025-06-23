@@ -9,9 +9,31 @@ from typing import Dict, Optional, Sequence, Tuple, Union
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.amp import custom_bwd, custom_fwd
 
 from .common import BaseOperator, get_xformers_operator, register_operator
 from .unbind import stack_or_none, unbind
+
+if torch.version.hip:
+
+    @torch.library.register_kernel("xformers::dual_gemm_silu_identity_mul", "cuda")  # type: ignore
+    def dual_gemm_silu_identity_mul_cuda(
+        x: torch.Tensor,
+        w1: torch.Tensor,
+        b1: Optional[torch.Tensor],
+        w2: torch.Tensor,
+        b2: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        x1 = x @ w1.T
+        if b1 is not None:
+            x1 += b1
+
+        x2 = x @ w2.T
+        if b2 is not None:
+            x2 += b2
+
+        x4 = F.silu(x1) * x2
+        return x1, x2, x4
 
 
 @register_operator
@@ -20,27 +42,12 @@ class DualGemmSiluOp(BaseOperator):
     OPERATOR_CATEGORY = "swiglu"
     NAME = "dual_gemm_silu"
 
-    @classmethod
-    # type: ignore
-    def operator_flop(
-        cls, x: torch.Tensor, w1: torch.Tensor, b1, w2: torch.Tensor, b2
-    ) -> int:
-        """NOTE: we neglect the impact of biases / pointwises"""
-        M, N, K = x.shape[0], w1.shape[0], w1.shape[1]
-        return M * N * K * 2 * 2
-
 
 @register_operator
 class GemmFusedSumOp(BaseOperator):
     OPERATOR = get_xformers_operator("gemm_fused_operand_sum")
     OPERATOR_CATEGORY = "swiglu"
     NAME = "gemm_fused_operand_sum"
-
-    @classmethod
-    # type: ignore
-    def operator_flop(cls, a: torch.Tensor, b: torch.Tensor, out1, out2) -> int:
-        M, N, K = a.shape[0], b.shape[1], a.shape[1]
-        return M * N * K * 2
 
 
 class _SwiGLUDecomposedFunc(torch.autograd.Function):
@@ -103,7 +110,7 @@ class _SwiGLUFusedFunc(torch.autograd.Function):
     NAME = "fused.py"
 
     @classmethod
-    @torch.cuda.amp.custom_fwd
+    @custom_fwd(device_type="cuda")
     def forward(cls, ctx, x, w1, b1, w2, b2, w3, b3):
         x1, x2, x4 = DualGemmSiluOp.OPERATOR(x, w1, b1, w2, b2)
 
@@ -118,13 +125,11 @@ class _SwiGLUFusedFunc(torch.autograd.Function):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         if not bias:
             return (dy.transpose(-2, -1) @ x), None
-        db = torch.empty([dy.shape[1]], dtype=dy.dtype, device=dy.device)
-        dw = torch.empty([dy.shape[1], x.shape[1]], dtype=dy.dtype, device=dy.device)
-        GemmFusedSumOp.OPERATOR(dy.transpose(-2, -1), x, dw, db)
+        dw, db = GemmFusedSumOp.OPERATOR(dy.transpose(-2, -1), x)
         return dw, db
 
     @classmethod
-    @torch.cuda.amp.custom_bwd
+    @custom_bwd(device_type="cuda")
     def backward(cls, ctx, dx5):
         x, w1, w2, w3, x1, x2 = ctx.saved_tensors
         w1w2 = stack_or_none([w1, w2], dim=0)
@@ -178,7 +183,7 @@ class SwiGLUOp:
         return all(c(op) for c in self.constraints)
 
     def __call__(self, *args: Optional[torch.Tensor]) -> torch.Tensor:
-        pass
+        raise NotImplementedError()
 
     def __str__(self) -> str:
         return f"SwiGLUOp:{self.NAME}"
@@ -186,10 +191,6 @@ class SwiGLUOp:
 
 class _ForwardToPythonAutogradFunc(SwiGLUOp):
     def supports(self, op: "SwiGLUOpDispatch") -> bool:
-        # Let's disable autocast in bf16 until this issue is fixed
-        # https://github.com/pytorch/pytorch/issues/87979
-        if op.dtype_autocast_gpu == torch.bfloat16:
-            return False
         return super().supports(op)
 
     def __call__(self, *args, **kwargs):
@@ -209,11 +210,11 @@ class _ForwardToFunc(SwiGLUOp):
 def _eager_functional_swiglu(
     x: torch.Tensor,
     w1: torch.Tensor,
-    b1: torch.Tensor,
+    b1: Optional[torch.Tensor],
     w2: torch.Tensor,
-    b2: torch.Tensor,
+    b2: Optional[torch.Tensor],
     w3: torch.Tensor,
-    b3: torch.Tensor,
+    b3: Optional[torch.Tensor],
 ) -> torch.Tensor:
     x1 = F.linear(x, w1, b1)
     x2 = F.linear(x, w2, b2)
@@ -263,9 +264,11 @@ class SwiGLUOpDispatch:
             device=x.device,
             dtype=x.dtype,
             packed_weights=stack_or_none((w1, w2), dim=0) is not None,
-            dtype_autocast_gpu=torch.get_autocast_gpu_dtype()
-            if torch.is_autocast_enabled()
-            else w1.dtype,
+            dtype_autocast_gpu=(
+                torch.get_autocast_gpu_dtype()
+                if torch.is_autocast_enabled()
+                else w1.dtype
+            ),
             bias_enabled=b1 is not None and b2 is not None and b3 is not None,
         )
 
@@ -319,7 +322,7 @@ def swiglu(
     w3: torch.Tensor,
     b3: Optional[torch.Tensor],
     *,
-    op: SwiGLUOp = None,
+    op: Optional[SwiGLUOp] = None,
 ) -> torch.Tensor:
     """
     Computes a SwiGLU block given the weights/bias of the 3
@@ -387,6 +390,46 @@ def swiglu(
     return op(x, w1w2, b1b2, w3, b3).reshape([*batch_shape, -1])
 
 
+def swiglu_packed(
+    x: torch.Tensor,
+    w1w2: torch.Tensor,
+    b1b2: Optional[torch.Tensor],
+    w3: torch.Tensor,
+    b3: Optional[torch.Tensor],
+    *,
+    op: SwiGLUOp,
+) -> torch.Tensor:
+    """
+    Computes a SwiGLU block given the weights/bias of the 3
+    linear layers.
+
+    :Equivalent pytorch code:
+
+    .. code-block:: python
+
+        x1 = F.linear(x, w1, b1)
+        x2 = F.linear(x, w2, b2)
+        hidden = F.silu(x1) * x2
+        return F.linear(hidden, w3, b3)
+
+    :Supported hardware:
+
+    This operator is only optimized on A100+ on ``torch.half`` or ``torch.bfloat16`` \
+        (autocast is supported), and will fallback to a functional pytorch \
+        implementation otherwise.
+    """
+    batch_shape = x.shape[:-1]
+    x = x.reshape([-1, x.shape[-1]])
+
+    if b3 is not None:
+        if b3.ndim != 1 or b3.shape[0] != w3.shape[0]:
+            raise ValueError(f"Invalid shapes for w3: {w3.shape} / b3: {b3.shape}")
+
+    assert op.PACKED_WEIGHTS, "Not implemented PACKED_WEIGHTS"
+
+    return op(x, w1w2, b1b2, w3, b3).reshape([*batch_shape, -1])
+
+
 class SwiGLU(nn.Module):
     """
     A Module that encapsulates the call to :attr:`xformers.ops.swiglu`,
@@ -426,7 +469,7 @@ class SwiGLU(nn.Module):
         self.hidden_features = hidden_features
         self.out_features = out_features
         self.in_features = in_features
-        self.op = None
+        self.op: Optional[SwiGLUOp] = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Computes :attr:`swiglu` with the module's weights
@@ -437,9 +480,25 @@ class SwiGLU(nn.Module):
         Returns:
             torch.Tensor: A Tensor of shape ``[..., out_features]``
         """
+        if self.w12 is not None:
+            if self.op is not None:
+                assert (
+                    self.op.PACKED_WEIGHTS
+                ), "_pack_weights and self.op.PACKED_WEIGHTS should match"
+                return swiglu_packed(x, *self._packed_ordered_params(), op=self.op)
+
         return swiglu(x, *self._ordered_params(), op=self.op)
 
-    def _ordered_params(self):
+    def _ordered_params(
+        self,
+    ) -> Tuple[
+        torch.Tensor,
+        Optional[torch.Tensor],
+        torch.Tensor,
+        Optional[torch.Tensor],
+        torch.Tensor,
+        Optional[torch.Tensor],
+    ]:
         """Used for testing - returns ordered arguments for operators"""
         b1: Optional[torch.Tensor]
         b2: Optional[torch.Tensor]
@@ -457,11 +516,39 @@ class SwiGLU(nn.Module):
         else:
             w1, w2 = self.w1.weight, self.w2.weight
             b1, b2 = self.w1.bias, self.w2.bias
-        return [
+
+        return (
             w1,
             b1,
             w2,
             b2,
             self.w3.weight,
             self.w3.bias,
-        ]
+        )
+
+    def _packed_ordered_params(
+        self,
+    ) -> Tuple[
+        torch.Tensor,
+        Optional[torch.Tensor],
+        torch.Tensor,
+        Optional[torch.Tensor],
+    ]:
+        assert self.w12 is not None, "Packed weights are only available when using w12"
+
+        """Used for testing - returns ordered arguments for packed operators"""
+        w1w2 = self.w12.weight
+        b1b2_param = self.w12.bias
+
+        w1w2 = w1w2.view([2, w1w2.shape[0] // 2, w1w2.shape[1]])
+
+        b1b2: Optional[torch.Tensor] = None
+        if b1b2_param is not None:
+            b1b2 = b1b2_param.view([2, b1b2_param.shape[0] // 2])
+
+        return (
+            w1w2,
+            b1b2,
+            self.w3.weight,
+            self.w3.bias,
+        )

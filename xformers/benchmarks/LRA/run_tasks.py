@@ -10,12 +10,12 @@ import logging
 import os
 from enum import Enum
 from pathlib import Path
-from typing import Dict, Tuple, cast
+from typing import cast, Dict, Tuple
 
 import pytorch_lightning as pl
 import torch
 import torch.nn as nn
-from fvcore.nn import FlopCountAnalysis, flop_count_str
+from fvcore.nn import flop_count_str, FlopCountAnalysis
 from pytorch_lightning.callbacks import ModelCheckpoint, TQDMProgressBar
 from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.strategies import DDPStrategy
@@ -53,9 +53,11 @@ def build_model(args: argparse.Namespace, config: Dict) -> nn.Module:
 
     model = cast(
         pl.LightningModule,
-        ModelForSCDual(config[f"{task}"], attention_name)
-        if task == Task.Retrieval
-        else ModelForSC(config[f"{task}"], attention_name),
+        (
+            ModelForSCDual(config[f"{task}"], attention_name)
+            if task == Task.Retrieval
+            else ModelForSC(config[f"{task}"], attention_name)
+        ),
     )
 
     logging.info(model)
@@ -252,9 +254,11 @@ def benchmark(args):
 
     trainer = pl.Trainer(
         accelerator="gpu",
-        strategy=DDPStrategy(find_unused_parameters=args.debug)
-        if not args.skip_train
-        else None,
+        strategy=(
+            DDPStrategy(find_unused_parameters=args.debug)
+            if not args.skip_train
+            else None
+        ),
         accumulate_grad_batches=config_training["gradient_accumulation"],
         callbacks=[progress_bar, checkpoint_callback],
         detect_anomaly=args.debug,

@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * All rights reserved.
+ *
+ * This source code is licensed under the BSD-style license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
 #include <ATen/ATen.h>
 #include <torch/types.h>
 
@@ -75,9 +82,10 @@ at::Tensor matmul_with_sparse_mask(
 
   at::Tensor res = at::empty({nnz}, a.options());
 
-  dim3 grid(std::min(
-      ceil_div(static_cast<int64_t>(nnz), static_cast<int64_t>(512)),
-      static_cast<int64_t>(4096)));
+  dim3 grid(
+      std::min(
+          ceil_div(static_cast<int64_t>(nnz), static_cast<int64_t>(512)),
+          static_cast<int64_t>(4096)));
   dim3 block(512);
 
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -85,10 +93,10 @@ at::Tensor matmul_with_sparse_mask(
   AT_DISPATCH_FLOATING_TYPES_AND_HALF(
       a.scalar_type(), "matmul_with_sparse_mask_kernel", [&] {
         matmul_with_sparse_mask_kernel<scalar_t><<<grid, block, 0, stream>>>(
-            res.packed_accessor<scalar_t, 1>(),
-            a.packed_accessor<scalar_t, 3>(),
-            bt.packed_accessor<scalar_t, 3>(),
-            idxs.packed_accessor<int64_t, 2>());
+            res.packed_accessor64<scalar_t, 1>(),
+            a.packed_accessor64<scalar_t, 3>(),
+            bt.packed_accessor64<scalar_t, 3>(),
+            idxs.packed_accessor64<int64_t, 2>());
       });
 
   AT_CUDA_CHECK(cudaGetLastError());

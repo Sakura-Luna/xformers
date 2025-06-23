@@ -12,31 +12,55 @@ import importlib.util
 import json
 import os
 import platform
+import re
 import shlex
 import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 import setuptools
 import torch
 from torch.utils.cpp_extension import (
-    CUDA_HOME,
     BuildExtension,
     CppExtension,
+    CUDA_HOME,
     CUDAExtension,
+    ROCM_HOME,
 )
 
 this_dir = os.path.dirname(__file__)
+pt_attn_compat_file_path = os.path.join(
+    this_dir, "xformers", "ops", "fmha", "torch_attention_compat.py"
+)
+
+# Define the module name
+module_name = "torch_attention_compat"
+
+# Load the module
+spec = importlib.util.spec_from_file_location(module_name, pt_attn_compat_file_path)
+assert spec is not None
+attn_compat_module = importlib.util.module_from_spec(spec)
+sys.modules[module_name] = attn_compat_module
+assert spec.loader is not None
+spec.loader.exec_module(attn_compat_module)
 
 
-def get_extra_nvcc_flags_for_build_type() -> List[str]:
+def get_extra_nvcc_flags_for_build_type(cuda_version: int) -> List[str]:
     build_type = os.environ.get("XFORMERS_BUILD_TYPE", "RelWithDebInfo").lower()
     if build_type == "relwithdebinfo":
+        if cuda_version >= 1201 and cuda_version < 1202:
+            print(
+                "Looks like we are using CUDA 12.1 which segfaults when provided with"
+                " the -generate-line-info flag. Disabling it."
+            )
+            return []
         return ["--generate-line-info"]
     elif build_type == "release":
         return []
+    elif build_type == "debug":
+        return ["--device-debug"]
     else:
         raise ValueError(f"Unknown build type: {build_type}")
 
@@ -48,6 +72,9 @@ def fetch_requirements():
 
 
 def get_local_version_suffix() -> str:
+    if not (Path(__file__).parent / ".git").is_dir():
+        # Most likely installing from a source distribution
+        return ""
     date_suffix = datetime.datetime.now().strftime("%Y%m%d")
     git_hash = subprocess.check_output(
         ["git", "rev-parse", "--short", "HEAD"], cwd=Path(__file__).parent
@@ -55,14 +82,27 @@ def get_local_version_suffix() -> str:
     return f"+{git_hash}.d{date_suffix}"
 
 
-def write_version_file(version: str):
-    version_path = os.path.join(this_dir, "xformers", "version.py")
-    with open(version_path, "w") as f:
-        f.write("# noqa: C801\n")
-        f.write(f'__version__ = "{version}"\n')
-        tag = os.getenv("GIT_TAG")
-        if tag is not None:
-            f.write(f'git_tag = "{tag}"\n')
+def get_flash_version() -> str:
+    flash_dir = Path(__file__).parent / "third_party" / "flash-attention"
+    try:
+        return subprocess.check_output(
+            ["git", "describe", "--tags", "--always"],
+            cwd=flash_dir,
+        ).decode("ascii")[:-1]
+    except subprocess.CalledProcessError:
+        version = flash_dir / "version.txt"
+        if version.is_file():
+            return version.read_text().strip()
+        return "v?"
+
+
+def generate_version_py(version: str) -> str:
+    content = "# noqa: C801\n"
+    content += f'__version__ = "{version}"\n'
+    tag = os.getenv("GIT_TAG")
+    if tag is not None:
+        content += f'git_tag = "{tag}"\n'
+    return content
 
 
 def symlink_package(name: str, path: Path, is_building_wheel: bool) -> None:
@@ -103,82 +143,259 @@ def get_cuda_version(cuda_dir) -> int:
     return bare_metal_major * 100 + bare_metal_minor
 
 
-def get_flash_attention_extensions(cuda_version: int, extra_compile_args):
+def get_hip_version(rocm_dir) -> Optional[str]:
+    hipcc_bin = "hipcc" if rocm_dir is None else os.path.join(rocm_dir, "bin", "hipcc")
+    try:
+        raw_output = subprocess.check_output(
+            [hipcc_bin, "--version"], universal_newlines=True
+        )
+    except Exception as e:
+        print(
+            f"hip installation not found: {e} ROCM_PATH={os.environ.get('ROCM_PATH')}"
+        )
+        return None
+    for line in raw_output.split("\n"):
+        if "HIP version" in line:
+            return line.split()[-1]
+    return None
+
+
+######################################
+# FLASH-ATTENTION v2
+######################################
+# Supports `9.0`, `9.0+PTX`, `9.0a+PTX` etc...
+PARSE_CUDA_ARCH_RE = re.compile(
+    r"(?P<major>[0-9]+)\.(?P<minor>[0-9])(?P<suffix>[a-zA-Z]{0,1})(?P<ptx>\+PTX){0,1}"
+)
+
+
+def get_flash_attention2_nvcc_archs_flags(cuda_version: int):
+    # XXX: Not supported on windows for cuda<12
+    # https://github.com/Dao-AILab/flash-attention/issues/345
+    if platform.system() != "Linux" and cuda_version < 1200:
+        return []
     # Figure out default archs to target
     DEFAULT_ARCHS_LIST = ""
-    if cuda_version > 1100:
-        DEFAULT_ARCHS_LIST = "7.5;8.0;8.6"
+    if cuda_version >= 1208:
+        DEFAULT_ARCHS_LIST = "8.0;8.6;9.0;10.0;12.0"
+    elif cuda_version >= 1108:
+        DEFAULT_ARCHS_LIST = "8.0;8.6;9.0"
+    elif cuda_version > 1100:
+        DEFAULT_ARCHS_LIST = "8.0;8.6"
     elif cuda_version == 1100:
-        DEFAULT_ARCHS_LIST = "7.5;8.0"
+        DEFAULT_ARCHS_LIST = "8.0"
     else:
         return []
 
-    if os.getenv("XFORMERS_DISABLE_FLASH_ATTN", "0") != "0":
+    if os.getenv("XFORMERS_DISABLE_FLASH_ATTN", "1") != "0":
         return []
 
     archs_list = os.environ.get("TORCH_CUDA_ARCH_LIST", DEFAULT_ARCHS_LIST)
     nvcc_archs_flags = []
     for arch in archs_list.replace(" ", ";").split(";"):
-        assert len(arch) >= 3, f"Invalid sm version: {arch}"
-
-        num = 10 * int(arch[0]) + int(arch[2])
-        # Need at least 7.5
-        if num < 75:
+        match = PARSE_CUDA_ARCH_RE.match(arch)
+        assert match is not None, f"Invalid sm version: {arch}"
+        num = 10 * int(match.group("major")) + int(match.group("minor"))
+        # Need at least Sm80
+        if num < 80:
             continue
-        nvcc_archs_flags.append(f"-gencode=arch=compute_{num},code=sm_{num}")
-        if arch.endswith("+PTX"):
-            nvcc_archs_flags.append(f"-gencode=arch=compute_{num},code=compute_{num}")
+        # Sm90 requires nvcc 11.8+
+        if num >= 90 and cuda_version < 1108:
+            continue
+        suffix = match.group("suffix")
+        nvcc_archs_flags.append(
+            f"-gencode=arch=compute_{num}{suffix},code=sm_{num}{suffix}"
+        )
+        if match.group("ptx") is not None:
+            nvcc_archs_flags.append(
+                f"-gencode=arch=compute_{num}{suffix},code=compute_{num}{suffix}"
+            )
+
+    return nvcc_archs_flags
+
+
+def get_flash_attention2_extensions(cuda_version: int, extra_compile_args):
+    nvcc_archs_flags = get_flash_attention2_nvcc_archs_flags(cuda_version)
+
     if not nvcc_archs_flags:
         return []
 
     flash_root = os.path.join(this_dir, "third_party", "flash-attention")
-    if not os.path.exists(flash_root):
+    cutlass_inc = os.path.join(flash_root, "csrc", "cutlass", "include")
+    if not os.path.exists(flash_root) or not os.path.exists(cutlass_inc):
         raise RuntimeError(
             "flashattention submodule not found. Did you forget "
             "to run `git submodule update --init --recursive` ?"
         )
 
+    sources = ["csrc/flash_attn/flash_api.cpp"]
+    for f in glob.glob(os.path.join(flash_root, "csrc", "flash_attn", "src", "*.cu")):
+        if "hdim224" in Path(f).name:
+            continue
+        sources.append(str(Path(f).relative_to(flash_root)))
+    common_extra_compile_args = [
+        "-DFLASHATTENTION_DISABLE_ALIBI",
+        "-DFLASHATTENTION_DISABLE_SOFTCAP",
+    ]
     return [
         CUDAExtension(
             name="xformers._C_flashattention",
-            sources=[
-                os.path.join("third_party", "flash-attention", path)
-                for path in [
-                    "csrc/flash_attn/fmha_api.cpp",
-                    "csrc/flash_attn/src/fmha_fwd_hdim32.cu",
-                    "csrc/flash_attn/src/fmha_fwd_hdim64.cu",
-                    "csrc/flash_attn/src/fmha_fwd_hdim128.cu",
-                    "csrc/flash_attn/src/fmha_bwd_hdim32.cu",
-                    "csrc/flash_attn/src/fmha_bwd_hdim64.cu",
-                    "csrc/flash_attn/src/fmha_bwd_hdim128.cu",
-                    "csrc/flash_attn/src/fmha_block_fprop_fp16_kernel.sm80.cu",
-                    "csrc/flash_attn/src/fmha_block_dgrad_fp16_kernel_loop.sm80.cu",
-                ]
-            ],
+            sources=[os.path.join(flash_root, path) for path in sources],
             extra_compile_args={
-                **extra_compile_args,
+                "cxx": extra_compile_args.get("cxx", []) + common_extra_compile_args,
                 "nvcc": extra_compile_args.get("nvcc", [])
                 + [
                     "-O3",
                     "-std=c++17",
+                    "-U__CUDA_NO_HALF_OPERATORS__",
+                    "-U__CUDA_NO_HALF_CONVERSIONS__",
+                    "-U__CUDA_NO_HALF2_OPERATORS__",
+                    "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
                     "--expt-relaxed-constexpr",
                     "--expt-extended-lambda",
                     "--use_fast_math",
                     "--ptxas-options=-v",
                 ]
                 + nvcc_archs_flags
-                + get_extra_nvcc_flags_for_build_type(),
+                + common_extra_compile_args
+                + get_extra_nvcc_flags_for_build_type(cuda_version),
             },
             include_dirs=[
                 p.absolute()
                 for p in [
                     Path(flash_root) / "csrc" / "flash_attn",
                     Path(flash_root) / "csrc" / "flash_attn" / "src",
-                    Path(this_dir) / "third_party" / "cutlass" / "include",
+                    Path(flash_root) / "csrc" / "cutlass" / "include",
                 ]
             ],
+            py_limited_api=True,
         )
     ]
+
+
+######################################
+# FLASH-ATTENTION v3
+######################################
+def get_flash_attention3_nvcc_archs_flags(cuda_version: int):
+    if os.getenv("XFORMERS_DISABLE_FLASH_ATTN", "0") != "0":
+        return []
+    if cuda_version < 1203:
+        return []
+    archs_list = os.environ.get("TORCH_CUDA_ARCH_LIST")
+    if archs_list is None:
+        if torch.cuda.get_device_capability("cuda") != (9, 0):
+            return []
+        archs_list = "8.0 9.0a"
+    nvcc_archs_flags = []
+    for arch in archs_list.replace(" ", ";").split(";"):
+        match = PARSE_CUDA_ARCH_RE.match(arch)
+        assert match is not None, f"Invalid sm version: {arch}"
+        num = 10 * int(match.group("major")) + int(match.group("minor"))
+        if num not in [80, 90]:  # only support Sm80/Sm90
+            continue
+        suffix = match.group("suffix")
+        nvcc_archs_flags.append(
+            f"-gencode=arch=compute_{num}{suffix},code=sm_{num}{suffix}"
+        )
+        if match.group("ptx") is not None:
+            nvcc_archs_flags.append(
+                f"-gencode=arch=compute_{num}{suffix},code=compute_{num}{suffix}"
+            )
+    return nvcc_archs_flags
+
+
+def get_flash_attention3_extensions(cuda_version: int, extra_compile_args):
+    nvcc_archs_flags = get_flash_attention3_nvcc_archs_flags(cuda_version)
+
+    if not nvcc_archs_flags:
+        return []
+
+    flash_root = os.path.join(this_dir, "third_party", "flash-attention")
+    cutlass_inc = os.path.join(flash_root, "csrc", "cutlass", "include")
+    if not os.path.exists(flash_root) or not os.path.exists(cutlass_inc):
+        raise RuntimeError(
+            "flashattention submodule not found. Did you forget "
+            "to run `git submodule update --init --recursive` ?"
+        )
+
+    sources = [
+        str(Path(f).relative_to(flash_root))
+        for f in glob.glob(os.path.join(flash_root, "hopper", "*.cu"))
+        + glob.glob(os.path.join(flash_root, "hopper", "*.cpp"))
+        + glob.glob(os.path.join(flash_root, "hopper", "instantiations", "*.cu"))
+    ]
+    # hdimall and softcapall are .cu files which include all the other .cu files
+    # for explicit values hence causing us to build these kernels twice.
+    sources = [s for s in sources if ("hdimall" not in s and "softcapall" not in s)]
+
+    # We don't care/expose softcap and fp8 and paged attention,
+    # hence we disable them for faster builds.
+    DISABLED_CAPABILITIES = (
+        # (filename_pattern, compilation_flag)
+        # Not exposed in xFormers
+        ("softcap", "-DFLASHATTENTION_DISABLE_SOFTCAP"),
+        # Not exposed in xFormers
+        ("e4m3", "-DFLASHATTENTION_DISABLE_FP8"),
+        # Enabling paged attention causes segfault with some
+        # versions of nvcc :(
+        # https://github.com/Dao-AILab/flash-attention/issues/1453
+        ("paged", "-DFLASHATTENTION_DISABLE_PAGEDKV"),
+        # We have `CUDA_MINIMUM_COMPUTE_CAPABILITY` set to 9.0
+        # ("_sm80.cu", "-DFLASHATTENTION_DISABLE_SM8x"),
+    )
+    sources = [
+        s
+        for s in sources
+        if all(disabled_cap[0] not in s for disabled_cap in DISABLED_CAPABILITIES)
+    ]
+    common_extra_compile_args = [x[1] for x in DISABLED_CAPABILITIES]
+
+    return [
+        CUDAExtension(
+            name="xformers.flash_attn_3._C",
+            sources=[os.path.join(flash_root, path) for path in sources],
+            extra_compile_args={
+                "cxx": extra_compile_args.get("cxx", []) + common_extra_compile_args,
+                "nvcc": extra_compile_args.get("nvcc", [])
+                + [
+                    "-O3",
+                    # "-O0",
+                    "-std=c++17",
+                    "-U__CUDA_NO_HALF_OPERATORS__",
+                    "-U__CUDA_NO_HALF_CONVERSIONS__",
+                    "-U__CUDA_NO_BFLOAT16_OPERATORS__",
+                    "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+                    "-U__CUDA_NO_BFLOAT162_OPERATORS__",
+                    "-U__CUDA_NO_BFLOAT162_CONVERSIONS__",
+                    "--expt-relaxed-constexpr",
+                    "--expt-extended-lambda",
+                    "--use_fast_math",
+                    # "-lineinfo", # xformers: save binary size
+                    "-DCUTLASS_DEBUG_TRACE_LEVEL=0",  # Can toggle for debugging
+                    "-DNDEBUG",  # Important, otherwise performance is severely impacted
+                    "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED",
+                    "-DCUTLASS_ENABLE_GDC_FOR_SM90",
+                    "-D_USE_MATH_DEFINES",  # required for M_LOG2E on windows
+                ]
+                + nvcc_archs_flags
+                + common_extra_compile_args
+                + get_extra_nvcc_flags_for_build_type(cuda_version),
+            },
+            include_dirs=[
+                p.absolute()
+                for p in [
+                    Path(flash_root) / "csrc" / "cutlass" / "include",
+                    Path(flash_root) / "hopper",
+                ]
+            ],
+            py_limited_api=True,
+        )
+    ]
+
+
+def rename_cpp_cu(cpp_files):
+    for entry in cpp_files:
+        shutil.copy(entry, os.path.splitext(entry)[0] + ".cu")
 
 
 def get_extensions():
@@ -186,9 +403,50 @@ def get_extensions():
 
     sources = glob.glob(os.path.join(extensions_dir, "**", "*.cpp"), recursive=True)
     source_cuda = glob.glob(os.path.join(extensions_dir, "**", "*.cu"), recursive=True)
+    fmha_source_cuda = glob.glob(
+        os.path.join(extensions_dir, "**", "fmha", "**", "*.cu"), recursive=True
+    )
+    exclude_files = ["small_k.cu", "decoder.cu", "attention_cutlass_rand_uniform.cu"]
+    fmha_source_cuda = [
+        c
+        for c in fmha_source_cuda
+        if not any(exclude_file in c for exclude_file in exclude_files)
+    ]
+
+    source_hip = glob.glob(
+        os.path.join(extensions_dir, "attention", "hip_*", "**", "*.cpp"),
+        recursive=True,
+    )
+
+    source_hip_generated = glob.glob(
+        os.path.join(extensions_dir, "attention", "hip_*", "**", "*.cu"),
+        recursive=True,
+    )
+    # avoid the temporary .cu files generated under xformers/csrc/attention/hip_fmha
+    source_cuda = list(set(source_cuda) - set(source_hip_generated))
+    sources = list(set(sources) - set(source_hip))
 
     sputnik_dir = os.path.join(this_dir, "third_party", "sputnik")
+
+    xformers_pt_cutlass_attn = os.getenv("XFORMERS_PT_CUTLASS_ATTN")
+    # By default, we try to link to torch internal CUTLASS attention implementation
+    # and silently switch to local CUTLASS attention build if no compatibility
+    # If we force 'torch CUTLASS switch' then setup will fail when no compatibility
+    if (
+        xformers_pt_cutlass_attn is None or xformers_pt_cutlass_attn == "1"
+    ) and attn_compat_module.is_pt_cutlass_compatible(
+        force=xformers_pt_cutlass_attn == "1"
+    ):
+        source_cuda = list(set(source_cuda) - set(fmha_source_cuda))
+
+    if "XFORMERS_SELECTIVE_BUILD" in os.environ:
+        pattern = os.environ["XFORMERS_SELECTIVE_BUILD"]
+        source_cuda = [f for f in source_cuda if pattern in str(f)]
+
     cutlass_dir = os.path.join(this_dir, "third_party", "cutlass", "include")
+    cutlass_util_dir = os.path.join(
+        this_dir, "third_party", "cutlass", "tools", "util", "include"
+    )
     cutlass_examples_dir = os.path.join(this_dir, "third_party", "cutlass", "examples")
     if not os.path.exists(cutlass_dir):
         raise RuntimeError(
@@ -201,25 +459,40 @@ def get_extensions():
 
     define_macros = []
 
-    extra_compile_args = {"cxx": ["-O3"]}
+    extra_compile_args = {"cxx": ["-O3", "-std=c++17", "-DPy_LIMITED_API=0x03090000"]}
     if sys.platform == "win32":
         define_macros += [("xformers_EXPORTS", None)]
-        extra_compile_args["cxx"].extend(["/MP", "/Zc:lambda", "/Zc:preprocessor"])
+        extra_compile_args["cxx"].extend(
+            ["/MP", "/Zc:lambda", "/Zc:preprocessor", "/Zc:__cplusplus"]
+        )
     elif "OpenMP not found" not in torch.__config__.parallel_info():
         extra_compile_args["cxx"].append("-fopenmp")
 
     include_dirs = [extensions_dir]
     ext_modules = []
     cuda_version = None
+    hip_version = None
+    flash_version = "0.0.0"
+    use_pt_flash = False
 
     if (
-        (torch.cuda.is_available() and ((CUDA_HOME is not None)))
+        (
+            torch.cuda.is_available()
+            and (CUDA_HOME is not None)
+            and (torch.version.cuda is not None)
+        )
         or os.getenv("FORCE_CUDA", "0") == "1"
         or os.getenv("TORCH_CUDA_ARCH_LIST", "") != ""
     ):
+        cuda_version = get_cuda_version(CUDA_HOME)
         extension = CUDAExtension
         sources += source_cuda
-        include_dirs += [sputnik_dir, cutlass_dir, cutlass_examples_dir]
+        include_dirs += [
+            sputnik_dir,
+            cutlass_dir,
+            cutlass_util_dir,
+            cutlass_examples_dir,
+        ]
         nvcc_flags = [
             "-DHAS_PYTORCH",
             "--use_fast_math",
@@ -227,11 +500,11 @@ def get_extensions():
             "-U__CUDA_NO_HALF_CONVERSIONS__",
             "--extended-lambda",
             "-D_ENABLE_EXTENDED_ALIGNED_STORAGE",
-        ] + get_extra_nvcc_flags_for_build_type()
+            "-std=c++17",
+        ] + get_extra_nvcc_flags_for_build_type(cuda_version)
         if os.getenv("XFORMERS_ENABLE_DEBUG_ASSERTIONS", "0") != "1":
             nvcc_flags.append("-DNDEBUG")
         nvcc_flags += shlex.split(os.getenv("NVCC_FLAGS", ""))
-        cuda_version = get_cuda_version(CUDA_HOME)
         if cuda_version >= 1102:
             nvcc_flags += [
                 "--threads",
@@ -240,17 +513,105 @@ def get_extensions():
             ]
         if sys.platform == "win32":
             nvcc_flags += [
-                "-std=c++17",
                 "-Xcompiler",
                 "/Zc:lambda",
                 "-Xcompiler",
                 "/Zc:preprocessor",
+                "-Xcompiler",
+                "/Zc:__cplusplus",
             ]
         extra_compile_args["nvcc"] = nvcc_flags
 
-        ext_modules += get_flash_attention_extensions(
-            cuda_version=cuda_version, extra_compile_args=extra_compile_args
-        )
+        xformers_pt_flash_attn = os.getenv("XFORMERS_PT_FLASH_ATTN")
+
+        # check if the current device supports flash_attention
+        flash_version = get_flash_version()
+        nvcc_archs_flags = get_flash_attention2_nvcc_archs_flags(cuda_version)
+        if not nvcc_archs_flags:
+            if xformers_pt_flash_attn == "1":
+                raise ValueError(
+                    "Current Torch Flash-Attention is not available on this device"
+                )
+        else:
+            # By default, we try to link to torch internal flash attention implementation
+            # and silently switch to local flash attention build if no compatibility
+            # If we force 'torch FA switch' then setup will fail when no compatibility
+            if (
+                xformers_pt_flash_attn is None or xformers_pt_flash_attn == "1"
+            ) and attn_compat_module.is_pt_flash_old(
+                force=xformers_pt_flash_attn == "1"
+            ) is not None:
+                use_pt_flash = True
+            else:
+                ext_modules += get_flash_attention2_extensions(
+                    cuda_version=cuda_version, extra_compile_args=extra_compile_args
+                )
+        ext_modules += get_flash_attention3_extensions(cuda_version, extra_compile_args)
+
+        # NOTE: This should not be applied to Flash-Attention
+        # see https://github.com/Dao-AILab/flash-attention/issues/359
+        if (
+            "--device-debug" not in nvcc_flags and "-G" not in nvcc_flags
+        ):  # (incompatible with -G)
+            extra_compile_args["nvcc"] += [
+                # Workaround for a regression with nvcc > 11.6
+                # See https://github.com/facebookresearch/xformers/issues/712
+                "--ptxas-options=-O2",
+                "--ptxas-options=-allow-expensive-optimizations=true",
+            ]
+    elif torch.version.hip and (
+        torch.cuda.is_available() or os.getenv("HIP_ARCHITECTURES", "") != ""
+    ):
+        rename_cpp_cu(source_hip)
+        hip_version = get_hip_version(ROCM_HOME)
+
+        source_hip_cu = []
+        for ff in source_hip:
+            source_hip_cu += [ff.replace(".cpp", ".cu")]
+
+        extension = CUDAExtension
+        sources += source_hip_cu
+        include_dirs += [
+            Path(this_dir) / "xformers" / "csrc" / "attention" / "hip_fmha",
+            Path(this_dir) / "xformers" / "csrc" / "attention" / "hip_decoder",
+        ]
+
+        include_dirs += [
+            Path(this_dir) / "third_party" / "composable_kernel_tiled" / "include"
+        ]
+
+        cc_flag = ["-DBUILD_PYTHON_PACKAGE"]
+        use_rtn_bf16_convert = os.getenv("ENABLE_HIP_FMHA_RTN_BF16_CONVERT", "0")
+        if use_rtn_bf16_convert == "1":
+            cc_flag += ["-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT=3"]
+
+        arch_list = os.getenv("HIP_ARCHITECTURES", "native").split()
+
+        offload_compress_flag = []
+        if hip_version >= "6.2.":
+            offload_compress_flag = ["--offload-compress"]
+
+        extra_compile_args["nvcc"] = [
+            "-O3",
+            "-std=c++17",
+            *[f"--offload-arch={arch}" for arch in arch_list],
+            *offload_compress_flag,
+            "-U__CUDA_NO_HALF_OPERATORS__",
+            "-U__CUDA_NO_HALF_CONVERSIONS__",
+            "-DCK_TILE_FMHA_FWD_FAST_EXP2=1",
+            "-fgpu-flush-denormals-to-zero",
+            "-Werror",
+            "-Wc++11-narrowing",
+            "-Woverloaded-virtual",
+            "-mllvm",
+            "-enable-post-misched=0",
+            "-mllvm",
+            "-amdgpu-early-inline-all=true",
+            "-mllvm",
+            "-amdgpu-function-calls=false",
+            "-mllvm",
+            "-greedy-reverse-local-assignment=1",
+        ] + cc_flag
 
     ext_modules.append(
         extension(
@@ -259,19 +620,24 @@ def get_extensions():
             include_dirs=[os.path.abspath(p) for p in include_dirs],
             define_macros=define_macros,
             extra_compile_args=extra_compile_args,
+            py_limited_api=True,
         )
     )
 
     return ext_modules, {
         "version": {
             "cuda": cuda_version,
+            "hip": hip_version,
             "torch": torch.__version__,
             "python": platform.python_version(),
+            "flash": flash_version,
+            "use_torch_flash": use_pt_flash,
         },
         "env": {
             k: os.environ.get(k)
             for k in [
                 "TORCH_CUDA_ARCH_LIST",
+                "PYTORCH_ROCM_ARCH",
                 "XFORMERS_BUILD_TYPE",
                 "XFORMERS_ENABLE_DEBUG_ASSERTIONS",
                 "NVCC_FLAGS",
@@ -297,56 +663,43 @@ class clean(distutils.command.clean.clean):  # type: ignore
         distutils.command.clean.clean.run(self)
 
 
-class BuildExtensionWithMetadata(BuildExtension):
+class BuildExtensionWithExtraFiles(BuildExtension):
     def __init__(self, *args, **kwargs) -> None:
-        self.xformers_build_metadata = kwargs.pop("xformers_build_metadata")
+        self.xformers_build_metadata = kwargs.pop("extra_files")
         self.pkg_name = "xformers"
-        self.metadata_json = "cpp_lib.json"
         super().__init__(*args, **kwargs)
 
     def build_extensions(self) -> None:
         super().build_extensions()
-        with open(
-            os.path.join(self.build_lib, self.pkg_name, self.metadata_json), "w+"
-        ) as fp:
-            json.dump(self.xformers_build_metadata, fp)
+        for filename, content in self.xformers_build_metadata.items():
+            with open(
+                os.path.join(self.build_lib, self.pkg_name, filename), "w+"
+            ) as fp:
+                fp.write(content)
 
-    def copy_extensions_to_source(self):
+    def copy_extensions_to_source(self) -> None:
         """
         Used for `pip install -e .`
         Copies everything we built back into the source repo
         """
         build_py = self.get_finalized_command("build_py")
         package_dir = build_py.get_package_dir(self.pkg_name)
-        inplace_file = os.path.join(package_dir, self.metadata_json)
-        regular_file = os.path.join(self.build_lib, self.pkg_name, self.metadata_json)
-        self.copy_file(regular_file, inplace_file, level=self.verbose)
+
+        for filename in self.xformers_build_metadata.keys():
+            inplace_file = os.path.join(package_dir, filename)
+            regular_file = os.path.join(self.build_lib, self.pkg_name, filename)
+            self.copy_file(regular_file, inplace_file, level=self.verbose)
         super().copy_extensions_to_source()
 
 
 if __name__ == "__main__":
-
-    try:
-        # when installing as a source distribution, the version module should exist
-        # Let's import it manually to not trigger the load of the C++
-        # library - which does not exist yet, and creates a WARNING
-        spec = importlib.util.spec_from_file_location(
-            "xformers_version", os.path.join(this_dir, "xformers", "version.py")
-        )
-        if spec is None or spec.loader is None:
-            raise FileNotFoundError()
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        version = module.__version__
-    except FileNotFoundError:
-        if os.getenv("BUILD_VERSION"):  # In CI
-            version = os.getenv("BUILD_VERSION", "0.0.0")
-        else:
-            version_txt = os.path.join(this_dir, "version.txt")
-            with open(version_txt) as f:
-                version = f.readline().strip()
-            version += get_local_version_suffix()
-        write_version_file(version)
+    if os.getenv("BUILD_VERSION"):  # In CI
+        version = os.getenv("BUILD_VERSION", "0.0.0")
+    else:
+        version_txt = os.path.join(this_dir, "version.txt")
+        with open(version_txt) as f:
+            version = f.readline().strip()
+        version += get_local_version_suffix()
 
     is_building_wheel = "bdist_wheel" in sys.argv
     # Embed a fixed version of flash_attn
@@ -365,18 +718,20 @@ if __name__ == "__main__":
         description="XFormers: A collection of composable Transformer building blocks.",
         version=version,
         install_requires=fetch_requirements(),
-        packages=setuptools.find_packages(
-            exclude=("tests*", "benchmarks*", "experimental*")
-        ),
+        packages=setuptools.find_packages(exclude=("tests*", "benchmarks*")),
         ext_modules=extensions,
         cmdclass={
-            "build_ext": BuildExtensionWithMetadata.with_options(
-                no_python_abi_suffix=True, xformers_build_metadata=extensions_metadata
+            "build_ext": BuildExtensionWithExtraFiles.with_options(
+                no_python_abi_suffix=True,
+                extra_files={
+                    "cpp_lib.json": json.dumps(extensions_metadata),
+                    "version.py": generate_version_py(version),
+                },
             ),
             "clean": clean,
         },
         url="https://facebookresearch.github.io/xformers/",
-        python_requires=">=3.7",
+        python_requires=">=3.9",
         author="Facebook AI Research",
         author_email="oncall+xformers@xmail.facebook.com",
         long_description="XFormers: A collection of composable Transformer building blocks."
@@ -384,13 +739,14 @@ if __name__ == "__main__":
         + "defined as compatible and combined building blocks as opposed to monolithic models",
         long_description_content_type="text/markdown",
         classifiers=[
-            "Programming Language :: Python :: 3.7",
-            "Programming Language :: Python :: 3.8",
             "Programming Language :: Python :: 3.9",
             "Programming Language :: Python :: 3.10",
+            "Programming Language :: Python :: 3.11",
+            "Programming Language :: Python :: 3.12",
             "License :: OSI Approved :: BSD License",
             "Topic :: Scientific/Engineering :: Artificial Intelligence",
             "Operating System :: OS Independent",
         ],
         zip_safe=False,
+        options={"bdist_wheel": {"py_limited_api": "cp39"}},
     )

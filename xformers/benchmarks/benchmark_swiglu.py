@@ -10,10 +10,10 @@ from functools import partial
 from typing import Any
 
 import torch
-from torch.utils import benchmark
-from utils import benchmark_main_helper
 
 import xformers.ops.swiglu_op as xsw
+from torch.utils import benchmark
+from xformers.benchmarks.utils import benchmark_main_helper
 
 min_run_time = 0.5
 device = torch.device("cuda")
@@ -107,7 +107,7 @@ def benchmark_swiglu(shape, dtype, bias: bool):
 def benchmark_swiglu_bw(shape, dtype, bias: bool):
     if dtype == "autocast_half":
         inp_dtype, model_dtype = torch.float, torch.float
-        cm: Any = partial(torch.cuda.amp.autocast, enabled=True, dtype=torch.float16)
+        cm: Any = partial(torch.amp.autocast, "cuda", enabled=True, dtype=torch.float16)
     else:
         inp_dtype, model_dtype = dtype, dtype
         cm = nullcontext
@@ -156,5 +156,8 @@ def benchmark_swiglu_bw(shape, dtype, bias: bool):
     )
 
 
-benchmark_main_helper(benchmark_swiglu, CASES, min_run_time=min_run_time)
-benchmark_main_helper(benchmark_swiglu_bw, CASES, min_run_time=min_run_time)
+if torch.version.hip:
+    print("This benchmark could not be done on ROCM!")
+else:
+    benchmark_main_helper(benchmark_swiglu, CASES, min_run_time=min_run_time)
+    benchmark_main_helper(benchmark_swiglu_bw, CASES, min_run_time=min_run_time)

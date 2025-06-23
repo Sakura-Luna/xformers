@@ -4,28 +4,38 @@
 # LICENSE file in the root directory of this source tree.
 
 
-from typing import Any, List, Mapping, Optional, Set, Tuple, Union
+from dataclasses import replace
+from enum import Enum
+from functools import partial
+from typing import Any, Iterable, List, Optional, Set, Tuple, Union
 
 import torch
 
-from ..common import get_xformers_operator, register_operator
+from ..common import get_operator, register_operator
 from . import attn_bias
 from .attn_bias import (
     AttentionBias,
+    AttentionBiasSubTensor,
+    BlockDiagonalCausalLocalAttentionFromBottomRightMask,
+    BlockDiagonalCausalLocalAttentionMask,
     BlockDiagonalCausalMask,
     BlockDiagonalCausalWithOffsetPaddedKeysMask,
     BlockDiagonalMask,
+    LowerTriangularFromBottomRightLocalAttentionMask,
+    LowerTriangularFromBottomRightMask,
     LowerTriangularMask,
     LowerTriangularMaskWithTensorBias,
 )
 from .common import (
+    _attn_bias_apply,
     AttentionBwOpBase,
     AttentionFwOpBase,
+    check_lastdim_alignment_stride1,
     Context,
     Gradients,
     Inputs,
-    check_lastdim_alignment_stride1,
 )
+from .torch_attention_compat import is_pt_cutlass_compatible
 
 
 def _uses_tensorcores(sm: int, is_half: bool) -> bool:
@@ -60,13 +70,7 @@ def _get_seqlen_info(
     if isinstance(
         attn_bias, (BlockDiagonalMask, BlockDiagonalCausalWithOffsetPaddedKeysMask)
     ):
-        if (
-            isinstance(attn_bias, BlockDiagonalCausalWithOffsetPaddedKeysMask)
-            and attn_bias.causal_diagonal is not None
-        ):
-            attn_bias.causal_diagonal = attn_bias.causal_diagonal.to(inp.query.device)
-        attn_bias.k_seqinfo.to(inp.query.device)
-        attn_bias.q_seqinfo.to(inp.query.device)
+        assert attn_bias.k_seqinfo.seqstart.device == inp.query.device
         seqstart_k = attn_bias.k_seqinfo.seqstart
         seqstart_q = attn_bias.q_seqinfo.seqstart
         max_seqlen_q = attn_bias.q_seqinfo.max_seqlen
@@ -81,12 +85,13 @@ def _get_seqlen_info(
 
 
 def _get_tensor_bias(
-    attn_bias: Optional[Union[torch.Tensor, AttentionBias]]
+    attn_bias: Optional[Union[torch.Tensor, AttentionBias]],
 ) -> Optional[torch.Tensor]:
-    if isinstance(attn_bias, torch.Tensor):
+    if isinstance(attn_bias, AttentionBiasSubTensor):
+        if isinstance(attn_bias, LowerTriangularMaskWithTensorBias):
+            return attn_bias._subtensor
+    elif isinstance(attn_bias, torch.Tensor):
         return attn_bias
-    elif isinstance(attn_bias, LowerTriangularMaskWithTensorBias):
-        return attn_bias._bias
     return None
 
 
@@ -118,19 +123,38 @@ Example: use `attn_bias = torch.zeros([1, 1, 5, 8])[:,:,:,:5]` instead of `torch
             )
 
 
+class _CustomMaskType(int, Enum):
+    """
+    (Matches CustomMaskType in C++.)
+    """
+
+    NoCustomMask = 0
+    CausalFromTopLeft = 1
+    CausalFromBottomRight = 2
+
+
 def _custom_mask_type(bias: Optional[Union[torch.Tensor, AttentionBias]]) -> int:
     if isinstance(
         bias,
         (
             LowerTriangularMask,
             BlockDiagonalCausalMask,
-            BlockDiagonalCausalWithOffsetPaddedKeysMask,
+            BlockDiagonalCausalLocalAttentionMask,
         ),
     ):
-        return 1
-    if isinstance(bias, attn_bias.BlockDiagonalCausalFromBottomRightMask):
-        return 2
-    return 0
+        return int(_CustomMaskType.CausalFromTopLeft)
+    if isinstance(
+        bias,
+        (
+            LowerTriangularFromBottomRightMask,
+            LowerTriangularFromBottomRightLocalAttentionMask,
+            attn_bias.BlockDiagonalCausalFromBottomRightMask,
+            BlockDiagonalCausalWithOffsetPaddedKeysMask,
+            BlockDiagonalCausalLocalAttentionFromBottomRightMask,
+        ),
+    ):
+        return int(_CustomMaskType.CausalFromBottomRight)
+    return int(_CustomMaskType.NoCustomMask)
 
 
 @register_operator
@@ -140,24 +164,34 @@ class FwOp(AttentionFwOpBase):
     and GPUs as old as P100 (Sm60)
     """
 
-    OPERATOR = get_xformers_operator("efficient_attention_forward_cutlass")
+    OPERATOR = (
+        get_operator("aten", "_efficient_attention_forward")
+        if is_pt_cutlass_compatible()
+        else None
+    )
     SUPPORTED_DEVICES: Set[str] = {"cuda"}
     SUPPORTED_DTYPES: Set[torch.dtype] = {torch.float, torch.half, torch.bfloat16}
     SUPPORTED_MAX_K = 65536
-    SUPPORTED_ATTN_BIAS_TYPES: Set[Any] = {
+    SUPPORTED_ATTN_BIAS_TYPES: Iterable[Any] = (
         type(None),
         torch.Tensor,
         LowerTriangularMask,
+        LowerTriangularFromBottomRightMask,
+        LowerTriangularFromBottomRightLocalAttentionMask,
         LowerTriangularMaskWithTensorBias,
         BlockDiagonalMask,
         BlockDiagonalCausalMask,
         BlockDiagonalCausalWithOffsetPaddedKeysMask,
         attn_bias.BlockDiagonalCausalFromBottomRightMask,
-    }
+        attn_bias.BlockDiagonalCausalLocalAttentionMask,
+        BlockDiagonalCausalLocalAttentionFromBottomRightMask,
+    )
     SUPPORTS_DROPOUT = True
     SUPPORTS_CUSTOM_SCALE = True
     SUPPORTS_DIFFERENT_VALUE_EMBED = True
-    NAME = "cutlassF"
+    SUPPORTS_BMGHK = True
+    VARLEN_LSE_PACKED = False
+    NAME = "cutlassF-pt"
 
     _TEST_K: List[int] = [
         32,  # 64x64 kernel
@@ -171,40 +205,113 @@ class FwOp(AttentionFwOpBase):
     ) -> Tuple[torch.Tensor, Optional[Context]]:
         if type(inp.attn_bias) not in FwOp.SUPPORTED_ATTN_BIAS_TYPES:
             raise NotImplementedError("Unsupported attn_bias type")
-        seqstart_k, seqstart_q, max_seqlen_q, _ = _get_seqlen_info(inp)
-        out, lse, rng_seed, rng_offset = cls.OPERATOR(
-            query=inp.query,
-            key=inp.key,
-            value=inp.value,
-            attn_bias=_get_tensor_bias(inp.attn_bias),
-            seqstart_q=seqstart_q,
-            seqstart_k=seqstart_k,
-            max_seqlen_q=max_seqlen_q,
-            dropout_p=inp.p,
-            compute_logsumexp=needs_gradient,
-            custom_mask_type=_custom_mask_type(inp.attn_bias),
-            scale=inp.scale,
-            causal_diagonal=inp.attn_bias.causal_diagonal
-            if isinstance(inp.attn_bias, BlockDiagonalCausalWithOffsetPaddedKeysMask)
-            else None,
-            seqlen_k=inp.attn_bias.k_seqinfo.seqlen
-            if isinstance(inp.attn_bias, BlockDiagonalCausalWithOffsetPaddedKeysMask)
-            else None,
-        )
+        if inp.query.ndim in [3, 4]:
+            return cls.apply_bmhk(inp, needs_gradient=needs_gradient)
+        assert inp.query.ndim == 5, f"query has shape {inp.query.shape}"
         ctx: Optional[Context] = None
+        # XXX: Hackfix for BMGHK with H=1
+        # In that case we don't want to run G different streams because it adds
+        # some overhead
+        if inp.query.ndim == 5 and inp.query.shape[3] == 1:
+            slice_op = partial(torch.squeeze, dim=3)
+            inp = replace(
+                inp,
+                query=slice_op(inp.query),
+                key=slice_op(inp.key),
+                value=slice_op(inp.value),
+                attn_bias=_attn_bias_apply(
+                    inp.attn_bias, partial(torch.squeeze, dim=2)
+                ),
+            )
+            out, ctx = cls.apply_bmhk(inp, needs_gradient=needs_gradient)
+            out = out.unsqueeze(3)
+            if ctx is not None:
+                ctx = replace(ctx, lse=ctx.lse.unsqueeze(1), out=out)
+            return out, ctx
+
+        # Workaround until this is properly implemented in C++
+        # run each head group in a different stream
+        n_groups = inp.key.shape[2]
+        main_stream = torch.cuda.current_stream()
+        streams = [main_stream] + [
+            torch.cuda.Stream(device=inp.query.device) for _ in range(n_groups - 1)
+        ]
+        outs = []
+        for group, stream in enumerate(streams):
+            stream.wait_stream(main_stream)
+            with torch.cuda.stream(stream):
+                query = inp.query[:, :, group]
+                key = inp.key[:, :, group]
+                value = inp.value[:, :, group]
+                bias = _attn_bias_apply(
+                    inp.attn_bias, partial(torch.select, dim=1, index=group)
+                )
+                outs.append(
+                    cls.apply_bmhk(
+                        replace(inp, query=query, key=key, value=value, attn_bias=bias),
+                        needs_gradient=needs_gradient,
+                    )
+                )
+        for s in streams[1:]:
+            main_stream.wait_stream(s)
+        out = torch.stack([o[0] for o in outs], dim=2)
         if needs_gradient:
             ctx = Context(
                 out=out,
-                lse=lse,
+                lse=torch.stack([o[1].lse for o in outs], dim=1),  # type: ignore
+                op_bw=outs[0][1].op_bw,  # type: ignore
+            )
+        return out, ctx
+
+    @classmethod
+    def apply_bmhk(
+        cls, inp: Inputs, needs_gradient: bool
+    ) -> Tuple[torch.Tensor, Optional[Context]]:
+        if type(inp.attn_bias) not in FwOp.SUPPORTED_ATTN_BIAS_TYPES:
+            raise NotImplementedError("Unsupported attn_bias type")
+        seqstart_k, seqstart_q, max_seqlen_q, max_seqlen_k = _get_seqlen_info(inp)
+        out, lse, rng_seed, rng_offset, _, _ = cls.OPERATOR(
+            query=inp.query,
+            key=inp.key,
+            value=inp.value,
+            bias=_get_tensor_bias(inp.attn_bias),
+            cu_seqlens_q=seqstart_q,
+            cu_seqlens_k=seqstart_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            dropout_p=inp.p,
+            compute_log_sumexp=needs_gradient,
+            custom_mask_type=_custom_mask_type(inp.attn_bias),
+            scale=inp.scale,
+            seqlen_k=(
+                inp.attn_bias.k_seqinfo.seqlen
+                if isinstance(
+                    inp.attn_bias, BlockDiagonalCausalWithOffsetPaddedKeysMask
+                )
+                else None
+            ),
+            window_size=(
+                inp.attn_bias._window_size
+                if isinstance(
+                    inp.attn_bias,
+                    (
+                        BlockDiagonalCausalLocalAttentionMask,
+                        BlockDiagonalCausalLocalAttentionFromBottomRightMask,
+                        LowerTriangularFromBottomRightLocalAttentionMask,
+                    ),
+                )
+                else None
+            ),
+        )
+        ctx: Optional[Context] = None
+        if needs_gradient:
+            ctx = Context(out=out, lse=lse)
+            if inp.p != 0:
                 # cutlass forward is only compatible with cutlass backward if
                 # dropout is used (because of the way RNG states are passed and the
                 # way random numbers are generated during backward)
-                op_bw=BwOp if inp.p != 0 else None,
-            )
-            if inp.p != 0:
-                ctx.rng_state = torch.tensor(
-                    [rng_seed, rng_offset], dtype=torch.int64, device="cpu"
-                )
+                ctx.rng_state = (rng_seed, rng_offset)
+                ctx.op_bw = BwOp
         return out, ctx
 
     @classmethod
@@ -216,62 +323,41 @@ class FwOp(AttentionFwOpBase):
         _check_bias_alignment(reasons, d.attn_bias)
         return reasons
 
-    @classmethod
-    # type: ignore
-    def operator_flop(
-        cls,
-        q,
-        k,
-        v,
-        b,
-        seqstart_q,
-        seqstart_k,
-        max_seqlen_q_,
-        compute_lse,
-        custom_mask_type,
-        *a,
-    ) -> int:
-        return cls.attn_operator_flop(
-            q,
-            k,
-            v,
-            causal=custom_mask_type > 0,
-            seqstart_k=seqstart_k,
-            seqstart_q=seqstart_q,
-        )
-
 
 @register_operator
 class BwOp(AttentionBwOpBase):
     __doc__ = FwOp.__doc__
 
-    OPERATOR = get_xformers_operator("efficient_attention_backward_cutlass")
+    OPERATOR = (
+        get_operator("aten", "_efficient_attention_backward")
+        if is_pt_cutlass_compatible()
+        else None
+    )
+
     SUPPORTED_DEVICES = FwOp.SUPPORTED_DEVICES
     SUPPORTED_DTYPES = FwOp.SUPPORTED_DTYPES
     SUPPORTED_MAX_K = FwOp.SUPPORTED_MAX_K
-    SUPPORTED_ATTN_BIAS_TYPES: Set[Any] = {
+    SUPPORTED_ATTN_BIAS_TYPES: Iterable[Any] = (
         type(None),
         torch.Tensor,
         LowerTriangularMask,
+        LowerTriangularFromBottomRightMask,
+        # TODO: Still some infs/nans in the BW pass for
+        # local + causal
+        # LowerTriangularFromBottomRightLocalAttentionMask,
         # TODO: Fix handling of gradient through the fMHA autograd function
         # LowerTriangularMaskWithTensorBias,
         BlockDiagonalMask,
         BlockDiagonalCausalMask,
         attn_bias.BlockDiagonalCausalFromBottomRightMask,
-    }
+        attn_bias.BlockDiagonalCausalLocalAttentionMask,
+    )
     SUPPORTS_ATTN_BIAS_GRAD = True
     SUPPORTS_DROPOUT = FwOp.SUPPORTS_DROPOUT
     SUPPORTS_CUSTOM_SCALE = FwOp.SUPPORTS_CUSTOM_SCALE
     SUPPORTS_DIFFERENT_VALUE_EMBED = FwOp.SUPPORTS_DIFFERENT_VALUE_EMBED
-    NAME = "cutlassB"
-
-    ERROR_ATOL: Mapping[torch.dtype, float] = {
-        torch.float: 5e-4,
-        # increased from 9e-2, more opportunities for numerical errors when bias is
-        # used, noticed in gK on SM80
-        torch.half: 1e-1,
-        torch.bfloat16: 7e-1,
-    }
+    VARLEN_LSE_PACKED = False
+    NAME = "cutlassB-pt"
 
     _TEST_K: List[int] = [
         32,  # 64x64 kernel
@@ -319,16 +405,11 @@ class BwOp(AttentionBwOpBase):
         seqstart_k, seqstart_q, max_seqlen_q, max_seqlen_k = _get_seqlen_info(inp)
         dtype = inp.query.dtype
 
-        rng_seed = rng_offset = 0
+        rng_seed = rng_offset = torch.Tensor()
         if inp.p != 0.0:
-            if (
-                ctx.rng_state is None
-                or ctx.rng_state.dtype != torch.int64
-                or ctx.rng_state.device.type != "cpu"
-                or ctx.rng_state.shape != (2,)
-            ):
-                raise NotImplementedError(f"Invalid rng_state: {ctx.rng_state}")
-            rng_seed, rng_offset = ctx.rng_state.tolist()
+            assert ctx.rng_state is not None
+            rng_seed, rng_offset = ctx.rng_state
+        tensor_bias = _get_tensor_bias(inp.attn_bias)
 
         force_pad_inf = torch.cuda.get_device_capability(inp.query.device) == (7, 5)
         (grad_q, grad_k, grad_v, grad_bias) = cls.OPERATOR(
@@ -336,22 +417,38 @@ class BwOp(AttentionBwOpBase):
             inp.query,
             inp.key,
             inp.value,
-            _get_tensor_bias(inp.attn_bias),
+            bias=tensor_bias,
+            bias_requires_grad=(
+                tensor_bias.requires_grad if tensor_bias is not None else False
+            ),
             cu_seqlens_q=seqstart_q,
             cu_seqlens_k=seqstart_k,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
             logsumexp=ctx.get_padded_lse(32, force_pad_inf=force_pad_inf),
-            output=ctx.out.to(dtype),
+            out=ctx.out.to(dtype),
             dropout_p=inp.p,
             # if not using dropout, seed and offset are irrelevant but still expected
             # in function signature so just pass 0
             # seed and offset could be None if a different FW op other than cutlass
             # was used.
-            rng_seed=rng_seed,
-            rng_offset=rng_offset,
+            philox_seed=rng_seed,
+            philox_offset=rng_offset,
             custom_mask_type=_custom_mask_type(inp.attn_bias),
             scale=inp.scale,
+            num_splits_key=None,  # Let C++ determine it
+            window_size=(
+                inp.attn_bias._window_size
+                if isinstance(
+                    inp.attn_bias,
+                    (
+                        BlockDiagonalCausalLocalAttentionMask,
+                        BlockDiagonalCausalLocalAttentionFromBottomRightMask,
+                        LowerTriangularFromBottomRightLocalAttentionMask,
+                    ),
+                )
+                else None
+            ),
         )
 
         # c++/CUDA implementation returns an uninitialized tensor if bias doesn't
@@ -362,33 +459,3 @@ class BwOp(AttentionBwOpBase):
             grad_bias = None
 
         return Gradients(dq=grad_q, dk=grad_k, dv=grad_v, db=grad_bias)
-
-    @classmethod
-    # type: ignore
-    def operator_flop(
-        cls,
-        dO,
-        q,
-        k,
-        v,
-        b,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
-        logsumexp,
-        output,
-        dropout_p,
-        rng_seed,
-        rng_offset,
-        custom_mask_type,
-        scale,
-    ) -> int:
-        return cls.attn_operator_flop(
-            q,
-            k,
-            v,
-            seqstart_q=cu_seqlens_q,
-            seqstart_k=cu_seqlens_k,
-            causal=custom_mask_type > 0,
-        )

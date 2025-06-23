@@ -12,7 +12,7 @@ import os
 import pytorch_lightning as pl
 import torch
 import torch.nn as nn
-from pytorch_lightning import Trainer, seed_everything
+from pytorch_lightning import seed_everything, Trainer
 from pytorch_lightning.utilities import rank_zero_info
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset, RandomSampler
@@ -72,7 +72,7 @@ class GPT(pl.LightningModule):
                     },
                 },
                 "feedforward_config": {
-                    "name": "FusedMLP",  # Use MLP if Triton is not available
+                    "name": "MLP",
                     "dropout": self.hparams.mlp_pdrop,
                     "activation": "gelu",
                     "hidden_layer_multiplier": self.hparams.hidden_layer_multiplier,
@@ -310,7 +310,8 @@ if __name__ == "__main__":
     print(model)
 
     trainer = Trainer(
-        gpus=1,
+        gpusdevices=1,
+        accelerator="gpu",
         max_epochs=EPOCHS,
         precision=16,
         log_every_n_steps=1,

@@ -28,12 +28,24 @@ class _BuildInfo:
         return self.metadata["version"]["cuda"]
 
     @property
+    def hip_version(self) -> Optional[int]:
+        return self.metadata["version"]["hip"]
+
+    @property
     def torch_version(self) -> str:
         return self.metadata["version"]["torch"]
 
     @property
     def python_version(self) -> str:
         return self.metadata["version"]["python"]
+
+    @property
+    def flash_version(self) -> str:
+        return self.metadata["version"].get("flash", "0.0.0")
+
+    @property
+    def use_torch_flash(self) -> bool:
+        return self.metadata["version"].get("use_torch_flash", False)
 
     @property
     def build_env(self) -> Dict[str, Any]:
@@ -107,7 +119,10 @@ def _register_extensions():
     )
 
     extfinder = importlib.machinery.FileFinder(lib_dir, loader_details)
-    ext_specs = extfinder.find_spec("_C")
+    if torch.version.hip and not hasattr(torch.version, "git_version"):
+        ext_specs = extfinder.find_spec("_C_hip")
+    else:
+        ext_specs = extfinder.find_spec("_C")
     if ext_specs is None:
         raise xFormersWasNotBuiltException()
     cpp_lib_json = os.path.join(lib_dir, "cpp_lib.json")

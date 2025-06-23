@@ -7,14 +7,23 @@ from typing import Any, Optional, Sequence, Tuple
 
 import torch.nn as nn
 
-from .profiler import MemSnapshotsProfiler, NsightProfiler, PyTorchProfiler, _Profiler
-from .slow_ops_profiler import DetectSlowOpsProfiler
+from .profiler import (
+    _Profiler,
+    MemSnapshotsProfiler,
+    NsightProfiler,
+    PyTorchProfiler,
+    PyTorchProfiler_CUDAOnly,
+)
+from .profiler_dcgm import DCGMProfiler  # noqa: F401
 
 DEFAULT_SCHEDULE = (
     (MemSnapshotsProfiler, 0, 2),
-    (DetectSlowOpsProfiler, 2, 4),
     (NsightProfiler, 4, 6),
-    (PyTorchProfiler, 6, 20),
+    (PyTorchProfiler, 6, 7),
+    (PyTorchProfiler_CUDAOnly, 7, 8),
+    # TODO: Found issues where this can take minutes to
+    # start, as it flushes previous values
+    # (DCGMProfiler, 9, 11),
 )
 
 
@@ -48,7 +57,6 @@ def profile(
             module=model,
             schedule=[
                 (MemSnapshotsProfiler, 0, 2),
-                (DetectSlowOpsProfiler, 2, 4),
                 (NsightProfiler, 4, 6),
                 (PyTorchProfiler, 6, 20),
             ]
