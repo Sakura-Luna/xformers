@@ -76,7 +76,7 @@ jobs:
       matrix: ${{ fromJson(needs.target_determinator.outputs.matrix) }}
 
     uses: ./.github/workflows/wheels_build.yml
-    if: github.repository == 'facebookresearch/xformers' || github.event_name == 'pull_request'
+    if: github.repository == 'Sakura-Luna/xformers' || github.event_name == 'pull_request'
     with:
       os: ${{ matrix.os }}
       python: ${{ matrix.python }}
