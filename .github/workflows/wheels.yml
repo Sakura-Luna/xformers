@@ -1,119 +1,84 @@
-name: Build wheels
+name: wheels
 
 on:
-  workflow_dispatch: {}
+  pull_request:
+    paths:
+      - ".github/compute_wheel_version.py"
+      - ".github/workflows/wheel*"
+      - ".github/actions/setup-build-cuda/action.yml"
+      - "setup.py"
+      - "requirements*.txt"
   push:
     branches:
       - main
     tags:
       - "v[0-9]+*"
 
-# this yaml file can be cleaned up using yaml anchors, but they're not supported in github actions yet
-# https://github.com/actions/runner/issues/1182
-
-env:
-  TORCH_CUDA_ARCH_LIST: "8.0 8.6 9.0"
-  FORCE_CUDA: 1
-  MAX_JOBS: 1 # will crash otherwise
-  DISTUTILS_USE_SDK: 1 # otherwise distutils will complain on windows about multiple versions of msvc
-  XFORMERS_BUILD_TYPE: "Release"
-  TWINE_USERNAME: __token__
-  XFORMERS_PACKAGE_FROM: "wheel-${{ github.ref_name }}"
-
 jobs:
-  build_wheels:
+  target_determinator:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+    - id: set-matrix
+      shell: python
+      run: |
+        import os
+        import json
+        import itertools
+        environ = os.environ
+
+        # All builds are python-version agnostic,
+        # and built with python 3.9
+        PYTHON_VERSION = "3.9"
+        # NOTE: Don't forget to update `upload_pt`'s matrix
+        # when changing the CUDA/ROCM versions below!
+        CU_VERSIONS = ['118', '126', '128']
+        ROCM_VERSIONS = ["6.2.4", "6.3"]
+
+        include = []
+        for os in ['8-core-ubuntu', 'windows-8-core']:
+          for torch_version in ['2.7.0']:
+            # CUDA builds
+            for cuda_short_version in CU_VERSIONS:
+              if cuda_short_version < "124" and "windows" in os:
+                print("Windows builder no longer compatible with cu<124")
+                continue
+              include.append(dict(
+                os=os,
+                python=PYTHON_VERSION,
+                torch_version=torch_version,
+                toolkit_type="cuda",
+                toolkit_short_version=cuda_short_version,
+              ))
+              print(include[-1])
+            # ROCM builds
+            for rocm_short_version in ROCM_VERSIONS:
+              if os == 'windows-8-core':
+                continue
+              include.append(dict(
+                os="16-core-ubuntu",  # use for ROCm wheels only to avoid CI timeouts
+                python=PYTHON_VERSION,
+                torch_version=torch_version,
+                toolkit_type="rocm",
+                toolkit_short_version=rocm_short_version,
+              ))
+              print(include[-1])
+        matrix = {'include': include}
+        print(json.dumps(matrix))
+        with open(environ["GITHUB_OUTPUT"], "a") as fd:
+          fd.write("matrix="+json.dumps(matrix))
+  build:
+    needs: target_determinator
     strategy:
       fail-fast: false
-      matrix:
-        os:
-          # - ubuntu-22.04
-          - windows-2019
-        python:
-          - "3.11"
-          - "3.12"
-        config:
-          - torch_version: "2.8.0+cu128"
-            torch_version_constraint: "2.8.0"
-            cuda_version: "12.8.1"
-            pip_index: https://download.pytorch.org/whl/nightly/cu128
-            cuda_run_file: https://developer.download.nvidia.com/compute/cuda/12.8.1/local_installers/cuda_12.8.1_570.124.06_linux.run
-            publish: true # publish only latest version
+      matrix: ${{ fromJson(needs.target_determinator.outputs.matrix) }}
 
-          - torch_version: "2.8.0+cu126"
-            torch_version_constraint: "2.8.0"
-            cuda_version: "12.6.1"
-            pip_index: https://download.pytorch.org/whl/nightly/cu126
-            cuda_run_file: https://developer.download.nvidia.com/compute/cuda/12.8.1/local_installers/cuda_12.8.1_570.124.06_linux.run
-            publish: false
-
-          - torch_version: "2.3.1+cu118"
-            torch_version_constraint: "2.3.1"
-            cuda_version: "11.8.0"
-            pip_index: https://download.pytorch.org/whl/cu113
-            cuda_run_file: https://developer.download.nvidia.com/compute/cuda/11.8.0/local_installers/cuda_11.8.0_520.61.05_linux.run
-            publish: false
-
-    name: ${{ matrix.os }}-py${{ matrix.python }}-torch${{ matrix.config.torch_version }}
-    runs-on: ${{ matrix.os }}
-    env:
-      # alias for the current python version
-      # windows does not have per version binary, it is just 'python3'
-      PY: python${{ contains(matrix.os, 'ubuntu') && matrix.python || '3' }}
-
-    container: ${{ contains(matrix.os, 'ubuntu') && 'quay.io/pypa/manylinux2014_x86_64' || null }}
-    timeout-minutes: 360
-    defaults:
-      run:
-        shell: bash
-    steps:
-      - name: Recursive checkout
-        uses: actions/checkout@v4
-        with:
-          submodules: recursive
-          path: "."
-          fetch-depth: 0 # for tags
-
-      - if: runner.os == 'Linux'
-        name: (Linux) install cuda
-        run: >
-          yum install wget git prename -y &&
-          wget -q "${{ matrix.config.cuda_run_file }}" -O cuda.run &&
-          sh ./cuda.run --silent --toolkit &&
-          rm ./cuda.run
-
-      - if: runner.os == 'Windows'
-        name: (Windows) Setup Runner
-        uses: ./.github/actions/setup-windows-runner
-        with:
-          cuda: ${{ matrix.config.cuda_version }}
-          python: ${{ matrix.python }}
-
-      - name: Define version
-        run: |
-          set -Eeuo pipefail
-          git config --global --add safe.directory "*"
-          $PY -m pip install packaging
-          version=`$PY packaging/compute_wheel_version.py`
-          echo "BUILD_VERSION=$version" >> ${GITHUB_ENV}
-          cat ${GITHUB_ENV}
-
-      - name: Setup proper pytorch dependency in "requirements.txt"
-        run: |
-          sed -i '/torch/d' ./requirements.txt
-          echo "torch == ${{ matrix.config.torch_version_constraint }}" >> ./requirements.txt
-          cat ./requirements.txt
-
-      - name: Install dependencies
-        run: $PY -m pip install wheel setuptools twine -r requirements.txt --extra-index-url ${{ matrix.config.pip_index }}
-
-      - name: Build wheel
-        run: $PY setup.py bdist_wheel -d dist/ -k $PLAT_ARG
-        env:
-          PLAT_ARG: ${{ contains(matrix.os, 'ubuntu') && '--plat-name manylinux2014_x86_64' || '' }}
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.os }}-py${{ matrix.python }}-torch${{ matrix.config.torch_version }}
-          path: dist/*.whl
-
-# Note: it might be helpful to have additional steps that test if the built wheels actually work
+    uses: ./.github/workflows/wheels_build.yml
+    if: github.repository == 'facebookresearch/xformers' || github.event_name == 'pull_request'
+    with:
+      os: ${{ matrix.os }}
+      python: ${{ matrix.python }}
+      torch_version: ${{ matrix.torch_version }}
+      toolkit_type: ${{ matrix.toolkit_type }}
+      toolkit_short_version: ${{ matrix.toolkit_short_version }}
