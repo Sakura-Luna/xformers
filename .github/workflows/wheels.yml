@@ -12,7 +12,6 @@ on:
 # https://github.com/actions/runner/issues/1182
 
 env:
-  # you need at least cuda 5.0 for some of the stuff compiled here.
   TORCH_CUDA_ARCH_LIST: "8.0 8.6 9.0"
   FORCE_CUDA: 1
   MAX_JOBS: 1 # will crash otherwise
@@ -68,7 +67,7 @@ jobs:
         shell: bash
     steps:
       - name: Recursive checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           submodules: recursive
           path: "."
@@ -112,7 +111,7 @@ jobs:
         env:
           PLAT_ARG: ${{ contains(matrix.os, 'ubuntu') && '--plat-name manylinux2014_x86_64' || '' }}
 
-      - uses: actions/upload-artifact@v3
+      - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.os }}-py${{ matrix.python }}-torch${{ matrix.config.torch_version }}
           path: dist/*.whl
