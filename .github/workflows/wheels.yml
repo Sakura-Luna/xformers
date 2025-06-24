@@ -30,7 +30,7 @@ jobs:
 
         # All builds are python-version agnostic,
         # and built with python 3.9
-        PYTHON_VERSION = ['3.11', '3.12']
+        PYTHON_VERSION = "3.9"
         # NOTE: Don't forget to update `upload_pt`'s matrix
         # when changing the CUDA/ROCM versions below!
         CU_VERSIONS = ['118', '126', '128']
@@ -42,31 +42,30 @@ jobs:
           # for torch_version in ['2.7.0']:
           for torch_version in ['2.8.0']:
             # CUDA builds
-            for py_version in PYTHON_VERSION:
-              for cuda_short_version in CU_VERSIONS:
-                if cuda_short_version < "124" and "windows" in os:
-                  print("Windows builder no longer compatible with cu<124")
-                  continue
-                include.append(dict(
-                  os=os,
-                  python=py_version,
-                  torch_version=torch_version,
-                  toolkit_type="cuda",
-                  toolkit_short_version=cuda_short_version,
-                ))
-                print(include[-1])
-              # ROCM builds
-              # for rocm_short_version in ROCM_VERSIONS:
-              #   if os == 'windows-8-core':
-              #     continue
-              #   include.append(dict(
-              #     os="16-core-ubuntu",  # use for ROCm wheels only to avoid CI timeouts
-              #     python=py_version,
-              #     torch_version=torch_version,
-              #     toolkit_type="rocm",
-              #     toolkit_short_version=rocm_short_version,
-              #   ))
-              #   print(include[-1])
+            for cuda_short_version in CU_VERSIONS:
+              if cuda_short_version < "124" and "windows" in os:
+                print("Windows builder no longer compatible with cu<124")
+                continue
+              include.append(dict(
+                os=os,
+                python=PYTHON_VERSION,
+                torch_version=torch_version,
+                toolkit_type="cuda",
+                toolkit_short_version=cuda_short_version,
+              ))
+              print(include[-1])
+            # ROCM builds
+            # for rocm_short_version in ROCM_VERSIONS:
+            #   if os == 'windows-8-core':
+            #     continue
+            #   include.append(dict(
+            #     os="16-core-ubuntu",  # use for ROCm wheels only to avoid CI timeouts
+            #     python=PYTHON_VERSION,
+            #     torch_version=torch_version,
+            #     toolkit_type="rocm",
+            #     toolkit_short_version=rocm_short_version,
+            #   ))
+            #   print(include[-1])
         matrix = {'include': include}
         print(json.dumps(matrix))
         with open(environ["GITHUB_OUTPUT"], "a") as fd:
