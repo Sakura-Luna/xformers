@@ -109,13 +109,17 @@ jobs:
           cat ${GITHUB_ENV}
       - run: echo "xformers-${BUILD_VERSION}"
 
-      - name: Setup proper pytorch dependency in "requirements.txt"
+      - name: Setup proper pytorch dependency in "requirements.txt" # temp opera
         run: |
           sed -i '/torch/d' ./requirements.txt
-          echo "torch == ${{ inputs.torch_version }}" >> ./requirements.txt
+          if [[ "$INPUT_TORCH_VERSION" < "2.8" ]]; then
+            echo "torch == ${{ inputs.torch_version }}" >> ./requirements.txt
+          else
+            echo "torch" >> ./requirements.txt
+          fi
           cat ./requirements.txt
 
-      - name: Install corresponding PyTorch
+      - name: Install corresponding PyTorch # nightly
         run: |
           PYTORCH_INDEX_URL="https://download.pytorch.org/whl/nightly/${{ contains(inputs.toolkit_type, 'cuda') && 'cu' || 'rocm' }}${{ inputs.toolkit_short_version }}"
           $PY -m pip install wheel -r requirements.txt --extra-index-url $PYTORCH_INDEX_URL
