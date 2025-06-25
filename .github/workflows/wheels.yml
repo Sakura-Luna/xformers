@@ -33,7 +33,7 @@ jobs:
         PYTHON_VERSION = "3.9"
         # NOTE: Don't forget to update `upload_pt`'s matrix
         # when changing the CUDA/ROCM versions below!
-        CU_VERSIONS = ['118', '126', '128']
+        CU_VERSIONS = ['128']
         ROCM_VERSIONS = ["6.2.4", "6.3"]
         TORCH_VERSIONS = ['2.8.0']
 
