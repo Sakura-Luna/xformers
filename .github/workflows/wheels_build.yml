@@ -112,7 +112,7 @@ jobs:
       - name: Setup proper pytorch dependency in "requirements.txt" # temp opera
         run: |
           sed -i '/torch/d' ./requirements.txt
-          if [[ "$INPUT_TORCH_VERSION" < "2.8" ]]; then
+          if [[ ${{ inputs.torch_version }} < "2.8" ]]; then
             echo "torch == ${{ inputs.torch_version }}" >> ./requirements.txt
           else
             echo "torch" >> ./requirements.txt
