@@ -34,7 +34,6 @@ jobs:
         # NOTE: Don't forget to update `upload_pt`'s matrix
         # when changing the CUDA/ROCM versions below!
         CU_VERSIONS = ['128']
-        ROCM_VERSIONS = ["6.2.4", "6.3"]
         TORCH_VERSIONS = ['2.8.0']
 
         include = []
@@ -54,18 +53,6 @@ jobs:
                 toolkit_short_version=cuda_short_version,
               ))
               print(include[-1])
-            # ROCM builds
-            # for rocm_short_version in ROCM_VERSIONS:
-            #   if os == 'windows-8-core':
-            #     continue
-            #   include.append(dict(
-            #     os="16-core-ubuntu",  # use for ROCm wheels only to avoid CI timeouts
-            #     python=PYTHON_VERSION,
-            #     torch_version=torch_version,
-            #     toolkit_type="rocm",
-            #     toolkit_short_version=rocm_short_version,
-            #   ))
-            #   print(include[-1])
         matrix = {'include': include}
         print(json.dumps(matrix))
         with open(environ["GITHUB_OUTPUT"], "a") as fd:

@@ -112,19 +112,20 @@ jobs:
       - name: Setup proper pytorch dependency in "requirements.txt" # temp opera
         run: |
           sed -i '/torch/d' ./requirements.txt
-          if [[ ${{ inputs.torch_version }} < "2.8" ]]; then
+          if [[ ${{ inputs.torch_version }} < "2.9" ]]; then
             echo "torch == ${{ inputs.torch_version }}" >> ./requirements.txt
           else
             echo "torch" >> ./requirements.txt
           fi
           cat ./requirements.txt
 
-      - name: Install corresponding PyTorch # nightly
+      - name: Install corresponding PyTorch # nightly & rc
         run: |
-          PYTORCH_INDEX_URL="https://download.pytorch.org/whl/nightly/${{ contains(inputs.toolkit_type, 'cuda') && 'cu' || 'rocm' }}${{ inputs.toolkit_short_version }}"
           if [[ ${{ inputs.torch_version }} < "2.8" ]]; then
+            PYTORCH_INDEX_URL="https://download.pytorch.org/whl/${{ contains(inputs.toolkit_type, 'cuda') && 'cu' || 'rocm' }}${{ inputs.toolkit_short_version }}"
             $PY -m pip install wheel -r requirements.txt --extra-index-url $PYTORCH_INDEX_URL
           else
+            PYTORCH_INDEX_URL="https://download.pytorch.org/whl/test/${{ contains(inputs.toolkit_type, 'cuda') && 'cu' || 'rocm' }}${{ inputs.toolkit_short_version }}"
             $PY -m pip install --pre wheel -r requirements.txt --extra-index-url $PYTORCH_INDEX_URL
           fi
 
